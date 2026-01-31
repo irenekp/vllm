@@ -49,6 +49,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.lmcache_integration.utils impo
     lmcache_get_or_create_config,
     mla_enabled,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.lmcache_integration.telemetry import (
+    TimingRingBuffer,
+    VLLMTimingSink,
+)
+
 from vllm.distributed.parallel_state import get_tensor_model_parallel_rank, get_tp_group
 from vllm.sampling_params import SamplingParams
 from vllm.utils.math_utils import cdiv
@@ -604,6 +609,12 @@ class LMCacheConnectorV1Impl:
         self.async_loading = config.enable_async_loading
         self.layerwise_retrievers: list[Generator[torch.Tensor | None, None, None]] = []
         self._stats_monitor = LMCStatsMonitor.GetOrCreate()
+        self._timing_sink: VLLMTimingSink = VLLMTimingSink()
+        self._timing_ring: TimingRingBuffer = TimingRingBuffer(
+            capacity=vllm_config.kv_transfer_config.get_from_extra_config(
+                "timing_ring_capacity", 256
+            )
+        )
         if role == KVConnectorRole.SCHEDULER:
             # Create lookup client using factory
             self.lookup_client = LookupClientFactory.create_lookup_client(
@@ -617,6 +628,13 @@ class LMCacheConnectorV1Impl:
                 config,
                 vllm_config,
             )
+            assert self.lmcache_engine is not None
+            gpu_connector = getattr(self.lmcache_engine, "gpu_connector", None)
+            if gpu_connector is not None:
+                if hasattr(gpu_connector, "set_timing_sink"):
+                    gpu_connector.set_timing_sink(self._timing_sink)
+                else:
+                    setattr(gpu_connector, "_timing_sink", self._timing_sink)
 
             self.use_layerwise = config.use_layerwise
             self.enable_blending = config.enable_blending
@@ -1429,3 +1447,10 @@ class LMCacheConnectorV1Impl:
             }
 
         return False, return_params
+    
+    def get_timing_sink(self) -> VLLMTimingSink:
+        return self._timing_sink
+
+    def get_timing_ring_buffer(self) -> TimingRingBuffer:
+        return self._timing_ring
+

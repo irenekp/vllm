@@ -59,7 +59,9 @@ from vllm.v1.worker.worker_base import WorkerBase
 from vllm.v1.worker.workspace import init_workspace_manager
 
 from .utils import request_memory
-
+from vllm.distributed.kv_transfer.kv_connector.v1.lmcache_integration.telemetry import (
+    finalize_step_timing,
+)
 logger = init_logger(__name__)
 
 if TYPE_CHECKING:
@@ -1019,6 +1021,87 @@ class Worker(WorkerBase):
 
         if weight_transfer_engine := getattr(self, "weight_transfer_engine", None):
             weight_transfer_engine.shutdown()
+
+    def get_lmcache_batch_timing(self, mode: str = "last", last_n: int = 50):
+        model_runner = getattr(self, "model_runner", None)
+        if model_runner is None:
+            return None
+        active = getattr(model_runner, "kv_connector", None)
+        kv_group = getattr(active, "kv_connector", None)
+        lm_impl = getattr(kv_group, "_lmcache_engine", None)
+        if lm_impl is None:
+            return None
+
+        if not hasattr(lm_impl, "get_timing_ring_buffer"):
+            return None
+
+        ring = lm_impl.get_timing_ring_buffer()
+        def _finalize_one(ev):
+            rec = finalize_step_timing(ev, block=True)
+            if rec is None:
+                return None
+            if (not ev.stall_intervals) and (ev.forward_start is not None) and (ev.load_end is not None):
+                load_ms = ev.forward_start.elapsed_time(ev.load_end)
+                stall_ms = float(load_ms)
+                forward_ms = float(rec.forward_ms)
+                copy_ms = float(rec.copy_ms)
+                compute_ms = float(forward_ms - stall_ms)
+                return {
+                    "forward_ms": forward_ms,
+                    "stall_ms": stall_ms,
+                    "copy_ms": copy_ms,
+                    "compute_ms": compute_ms,
+                }
+
+            return {
+                "forward_ms": float(rec.forward_ms),
+                "stall_ms": float(rec.stall_ms),
+                "copy_ms": float(rec.copy_ms),
+                "compute_ms": float(rec.compute_ms),
+            }
+
+        if mode == "last":
+            ev = ring.last_events()
+            if ev is None:
+                return None
+            out = _finalize_one(ev)
+            if out is None:
+                return None
+            out["mode"] = "last"
+            return out
+
+        if mode == "avg":
+            all_ev = ring.all_events()
+            if not all_ev:
+                return None
+
+            n = max(1, min(int(last_n), len(all_ev)))
+            window = all_ev[-n:]
+
+            vals = []
+            for ev in window:
+                rec = _finalize_one(ev)
+                if rec is not None:
+                    vals.append(rec)
+
+            if not vals:
+                return None
+
+            forward_ms = sum(v["forward_ms"] for v in vals) / len(vals)
+            stall_ms = sum(v["stall_ms"] for v in vals) / len(vals)
+            copy_ms = sum(v["copy_ms"] for v in vals) / len(vals)
+            compute_ms = sum(v["compute_ms"] for v in vals) / len(vals)
+
+            return {
+                "mode": "avg",
+                "window": len(vals),
+                "forward_ms": float(forward_ms),
+                "stall_ms": float(stall_ms),
+                "copy_ms": float(copy_ms),
+                "compute_ms": float(compute_ms),
+            }
+        return {"error": f"unknown mode={mode}"}
+
 
 
 def init_worker_distributed_environment(

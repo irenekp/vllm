@@ -56,6 +56,59 @@ async def show_version():
     ver = {"version": VLLM_VERSION}
     return JSONResponse(content=ver)
 
+@router.get("/get_last_batch_timing")
+async def get_last_batch_timing(request: Request):
+    results = await engine_client(request).collective_rpc(
+        "get_lmcache_batch_timing",
+        kwargs={"mode": "last"},
+    )
+
+    per_rank = [r for r in results if r is not None]
+
+    if not per_rank:
+        return JSONResponse(content={"available": False, "per_rank": [], "aggregate": None})
+    
+    def _mean(key: str) -> float:
+        xs = [float(r[key]) for r in per_rank if key in r]
+        return sum(xs) / len(xs) if xs else 0.0
+
+    aggregate = {
+        "mode": "last",
+        "forward_ms": _mean("forward_ms"),
+        "stall_ms": _mean("stall_ms"),
+        "copy_ms": _mean("copy_ms"),
+        "compute_ms": _mean("compute_ms"),
+    }
+
+    return JSONResponse(content={"available": True, "per_rank": per_rank, "aggregate": aggregate})
+
+
+@router.get("/get_batch_timing_average")
+async def get_batch_timing_average(request: Request, last_n: int = 50):
+    results = await engine_client(request).collective_rpc(
+        "get_lmcache_batch_timing",
+        kwargs={"mode": "avg", "last_n": int(last_n)},
+    )
+
+    per_rank = [r for r in results if r is not None]
+
+    if not per_rank:
+        return JSONResponse(content={"available": False, "per_rank": [], "aggregate": None})
+
+    def _mean(key: str) -> float:
+        xs = [float(r[key]) for r in per_rank if key in r]
+        return sum(xs) / len(xs) if xs else 0.0
+
+    aggregate = {
+        "mode": "avg",
+        "window": int(min(r.get("window", 0) for r in per_rank if isinstance(r.get("window", None), int)) or 0),
+        "forward_ms": _mean("forward_ms"),
+        "stall_ms": _mean("stall_ms"),
+        "copy_ms": _mean("copy_ms"),
+        "compute_ms": _mean("compute_ms"),
+    }
+
+    return JSONResponse(content={"available": True, "per_rank": per_rank, "aggregate": aggregate})
 
 def register_basic_api_routers(app: FastAPI):
     app.include_router(router)

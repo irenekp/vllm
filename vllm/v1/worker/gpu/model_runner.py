@@ -791,6 +791,34 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.sampler.sampling_states.seeds.gpu,
         )
         return draft_tokens
+    
+    def _is_prefill_step(self, scheduler_output: "SchedulerOutput") -> bool:
+        if scheduler_output.scheduled_new_reqs:
+            return True
+        for _, n in scheduler_output.num_scheduled_tokens.items():
+            if n > 1:
+                return True
+        return False
+    
+    def _maybe_start_lmcache_timing_step(self, scheduler_output: "SchedulerOutput"):
+        if not self._is_prefill_step(scheduler_output):
+            return None, None
+
+        active = getattr(self, "kv_connector", None)
+        kv_group = getattr(active, "kv_connector", None)
+        if kv_group is None:
+            return None, None
+
+        lm_impl = getattr(kv_group, "_lmcache_engine", None)
+        if lm_impl is None:
+            return None, None
+        if not hasattr(lm_impl, "get_timing_sink"):
+            return None, None
+
+        sink = lm_impl.get_timing_sink()
+        if sink is None:
+            return None, None
+        return sink.start_step(), lm_impl
 
     @torch.inference_mode()
     def execute_model(
@@ -873,16 +901,31 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if not skip_attn_for_dummy_run:
                 self.prepare_dummy_attn_metadata(input_batch)
             # FIXME(woosuk): Fix warmup for LoRA.
-
+        timing_step, lm_impl = self._maybe_start_lmcache_timing_step(scheduler_output)
+        timing_stream = torch.cuda.current_stream()
         # Run model.
         if use_cudagraph:
             # Run CUDA graph.
             # NOTE(woosuk): Here, we don't need to pass the input tensors,
             # because they are already copied to the CUDA graph input buffers.
+            if timing_step is not None:
+                timing_step.forward_start = torch.cuda.Event(enable_timing=True)
+                timing_step.forward_start.record(timing_stream)
+
             self.kv_connector.pre_forward(scheduler_output)
+            if timing_step is not None:
+                timing_step.load_end = torch.cuda.Event(enable_timing=True)
+                timing_step.load_end.record(timing_stream)
             hidden_states = self.cudagraph_manager.run(
                 input_batch.num_tokens_after_padding
             )
+
+            if timing_step is not None:
+                timing_step.forward_end = torch.cuda.Event(enable_timing=True)
+                timing_step.forward_end.record(timing_stream)
+            if timing_step is not None and lm_impl is not None:
+                lm_impl.get_timing_ring_buffer().push_events(timing_step)
+                lm_impl.get_timing_sink().clear_current()
         else:
             # Run PyTorch model in eager mode.
             positions = input_batch.positions
@@ -898,12 +941,26 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 num_tokens_across_dp=num_tokens_across_dp,
                 slot_mapping=input_batch.slot_mappings,
             ):
+                if timing_step is not None:
+                    timing_step.forward_start = torch.cuda.Event(enable_timing=True)
+                    timing_step.forward_start.record(timing_stream)
+
                 self.kv_connector.pre_forward(scheduler_output)
+                if timing_step is not None:
+                    timing_step.load_end = torch.cuda.Event(enable_timing=True)
+                    timing_step.load_end.record(timing_stream)
                 hidden_states = self.model(
                     input_ids=input_batch.input_ids,
                     positions=positions,
                     inputs_embeds=input_batch.inputs_embeds,
                 )
+
+                if timing_step is not None:
+                    timing_step.forward_end = torch.cuda.Event(enable_timing=True)
+                    timing_step.forward_end.record(timing_stream)
+                if timing_step is not None and lm_impl is not None:
+                    lm_impl.get_timing_ring_buffer().push_events(timing_step)
+                    lm_impl.get_timing_sink().clear_current()
 
         kv_connector_output = self.kv_connector.post_forward(scheduler_output)
         self.execute_model_state = hidden_states, input_batch, kv_connector_output
