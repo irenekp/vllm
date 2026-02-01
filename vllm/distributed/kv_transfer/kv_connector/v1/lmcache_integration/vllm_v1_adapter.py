@@ -1204,6 +1204,9 @@ class LMCacheConnectorV1Impl:
             token_ids = token_ids[: -self.skip_last_n_tokens]
         lookup_prompt_len = len(token_ids)
         lookup_id = request.request_id if self.async_loading else str(uuid.uuid4())
+        if not hasattr(self, "_lookup_id_by_req"):
+            self._lookup_id_by_req = {}
+        self._lookup_id_by_req[request.request_id] = lookup_id
 
         self._lookup_requests_in_step.append(lookup_id)
 
@@ -1243,13 +1246,15 @@ class LMCacheConnectorV1Impl:
             num_external_hit_tokens,
             need_to_allocate,
         )
-
+        recalc_last_token = (num_external_hit_tokens == lookup_prompt_len)
         self.load_specs[request.request_id] = LoadSpec(
             vllm_cached_tokens=num_computed_tokens,
             lmcache_cached_tokens=num_external_hit_tokens,
             can_load=False,
+            lookup_prompt_len=lookup_prompt_len,
+            recalc_last_token=recalc_last_token,
+            lmcache_tier_hit_tokens=(tier_stats or None),
         )
-
         if need_to_allocate <= 0:
             return 0
 
@@ -1266,7 +1271,10 @@ class LMCacheConnectorV1Impl:
 
         # Clear local status in lookup client when a new request is
         # successfully scheduled.
-        self.lookup_client.clear_lookup_status(request.request_id)
+        lookup_id = None
+        if hasattr(self, "_lookup_id_by_req"):
+            lookup_id = self._lookup_id_by_req.get(request.request_id)
+        self.lookup_client.clear_lookup_status(lookup_id or request.request_id)
 
         kv_transfer_params = (
             request.kv_transfer_params
@@ -1345,10 +1353,17 @@ class LMCacheConnectorV1Impl:
         for finished_req_id in scheduler_output.finished_req_ids:
             self._request_trackers.pop(finished_req_id, None)
             self._unfinished_requests.pop(finished_req_id, None)
+            self.load_specs.pop(finished_req_id, None)
+
+            if hasattr(self, "_lookup_id_by_req"):
+                self._lookup_id_by_req.pop(finished_req_id, None)
+
+            if hasattr(self, "_lmcache_tier_stats_by_req"):
+                self._lmcache_tier_stats_by_req.pop(finished_req_id, None)
 
         for request in scheduler_output.scheduled_new_reqs:
             # Right now, we only load KV for new requests
-            load_spec = self.load_specs.pop(request.req_id, None)
+            load_spec = self.load_specs.get(request.req_id, None)
             num_tokens_to_compute = (
                 request.num_computed_tokens
                 + scheduler_output.num_scheduled_tokens[request.req_id]
