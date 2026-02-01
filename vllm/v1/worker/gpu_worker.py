@@ -1102,7 +1102,138 @@ class Worker(WorkerBase):
             }
         return {"error": f"unknown mode={mode}"}
 
+    def get_lmcache_residency_snapshot(self) -> dict[str, Any]:
+        model_runner = getattr(self, "model_runner", None)
+        if model_runner is None:
+            return {
+                "worker_id": getattr(self, "rank", -1),
+                "enabled": False,
+                "chunk_size_tokens": None,
+                "tiers": {},
+                "unsupported_tiers": [],
+                "engine_count": 0,
+            }
 
+        lm_impls: list[Any] = []
+        active = getattr(model_runner, "kv_connector", None)
+        kv_group = getattr(active, "kv_connector", None) if active is not None else None
+        lm_impl = getattr(kv_group, "_lmcache_engine", None) if kv_group is not None else None
+        if lm_impl is not None:
+            lm_impls.append(lm_impl)
+
+        uniq_impls: list[Any] = []
+        seen_ids: set[int] = set()
+        for impl in lm_impls:
+            impl_id = id(impl)
+            if impl_id not in seen_ids:
+                seen_ids.add(impl_id)
+                uniq_impls.append(impl)
+
+        if not uniq_impls:
+            return {
+                "worker_id": getattr(self, "rank", -1),
+                "enabled": False,
+                "chunk_size_tokens": None,
+                "tiers": {},
+                "unsupported_tiers": [],
+                "engine_count": 0,
+            }
+
+        def _normalize_hash_to_u64(x: Any) -> int | None:
+            if x is None:
+                return None
+            try:
+                if isinstance(x, (bytes, bytearray, memoryview)):
+                    b = bytes(x)
+                    # Keep low 64 bits (last 8 bytes) if longer than 8.
+                    if len(b) >= 8:
+                        b = b[-8:]
+                    else:
+                        b = b.rjust(8, b"\x00")
+                    return int.from_bytes(b, byteorder="big", signed=False)
+                if isinstance(x, np.generic):
+                    return int(x) & ((1 << 64) - 1)
+                if isinstance(x, int):
+                    return x & ((1 << 64) - 1)
+                return int(x) & ((1 << 64) - 1)
+            except Exception:
+                return None
+
+        tiers: dict[str, list[int]] = {}
+        unsupported: set[str] = set()
+        chunk_size_tokens: int | None = None
+
+        for impl in uniq_impls:
+            if chunk_size_tokens is None:
+                cfg = getattr(impl, "config", None)
+                if cfg is not None:
+                    chunk_size_tokens = getattr(cfg, "chunk_size", None)
+
+            storage_manager = getattr(impl, "storage_manager", None)
+            backends = getattr(storage_manager, "storage_backends", None) if storage_manager is not None else None
+            if not backends:
+                continue
+
+            for backend in backends:
+                backend_name = backend.__class__.__name__
+                keys: list[Any] = []
+
+                try:
+                    get_keys_fn = getattr(backend, "get_keys", None)
+                    if callable(get_keys_fn):
+                        keys = list(get_keys_fn())
+                    else:
+                        mapping = None
+                        lock = None
+
+                        mapping = getattr(backend, "hot_cache", None)
+                        lock = getattr(backend, "cpu_lock", None)
+
+                        if mapping is None:
+                            mapping = getattr(backend, "dict", None)
+                            lock = getattr(backend, "disk_lock", None)
+
+                        if mapping is None:
+                            unsupported.add(backend_name)
+                            continue
+
+                        if lock is not None:
+                            lock.acquire()
+                            try:
+                                keys = list(mapping.keys())
+                            finally:
+                                lock.release()
+                        else:
+                            keys = list(mapping.keys())
+
+                    if not keys:
+                        continue
+
+                    out = tiers.setdefault(backend_name, [])
+                    for k in keys:
+                        ch = getattr(k, "chunk_hash", None)
+                        h = _normalize_hash_to_u64(ch)
+                        if h is not None:
+                            out.append(h)
+
+                except Exception as e:
+                    logger.warning(
+                        "Failed to snapshot LMCache keys from backend %s: %s",
+                        backend_name,
+                        e,
+                    )
+                    unsupported.add(backend_name)
+
+        tiers = {name: list(set(vals)) for name, vals in tiers.items()}
+
+        return {
+            "worker_id": getattr(self, "rank", -1),
+            "enabled": True,
+            "chunk_size_tokens": chunk_size_tokens,
+            "tiers": tiers,
+            "unsupported_tiers": sorted(unsupported),
+            "engine_count": len(uniq_impls),
+        }
 
 def init_worker_distributed_environment(
     vllm_config: VllmConfig,
