@@ -80,7 +80,9 @@ class LoadSpec:
     lmcache_cached_tokens: int
     # Whether the scheduler allow us to load the tokens
     can_load: bool
-
+    lookup_prompt_len: int
+    recalc_last_token: bool = False
+    lmcache_tier_hit_tokens: dict[str, int] | None = None
 
 @dataclass
 class SaveSpec:
@@ -1200,6 +1202,7 @@ class LMCacheConnectorV1Impl:
         if self.skip_last_n_tokens > 0:
             assert token_ids is not None
             token_ids = token_ids[: -self.skip_last_n_tokens]
+        lookup_prompt_len = len(token_ids)
         lookup_id = request.request_id if self.async_loading else str(uuid.uuid4())
 
         self._lookup_requests_in_step.append(lookup_id)
@@ -1209,12 +1212,18 @@ class LMCacheConnectorV1Impl:
             lookup_id=lookup_id,
             request_configs=request_configs,
         )
+        if not hasattr(self, "_lmcache_tier_stats_by_req"):
+            self._lmcache_tier_stats_by_req = {}
+        tier_stats = None
+        if hasattr(self.lookup_client, "get_tier_stats"):
+            tier_stats = self.lookup_client.get_tier_stats(lookup_id)
+        self._lmcache_tier_stats_by_req[request.request_id] = tier_stats or {}
 
         if num_external_hit_tokens is None:
             logger.info(
-                "Reqid: %s, Total tokens %d, LMCache hit tokens: None.",
+                "Reqid: %s, Lookup prompt tokens %d, LMCache hit tokens: None.",
                 request.request_id,
-                request.num_tokens,
+                lookup_prompt_len,
             )
             return None
 
@@ -1224,14 +1233,13 @@ class LMCacheConnectorV1Impl:
         # a better support for this case.
         need_to_allocate = num_external_hit_tokens - num_computed_tokens
 
-        # In, full-prompt-hit case, we need to recompute the last token
-        if num_external_hit_tokens == request.num_tokens:
+        if num_external_hit_tokens == lookup_prompt_len:
             need_to_allocate -= 1
 
         logger.info(
-            "Reqid: %s, Total tokens %d, LMCache hit tokens: %d, need to load: %d",
+            "Reqid: %s, Lookup prompt tokens %d, LMCache hit tokens: %d, need to load: %d",
             request.request_id,
-            request.num_tokens,
+            lookup_prompt_len,
             num_external_hit_tokens,
             need_to_allocate,
         )
@@ -1445,6 +1453,40 @@ class LMCacheConnectorV1Impl:
             return_params = {
                 "first_tok": request._output_token_ids[0],
             }
+        # ---- Per-request cache hit breakdown (prefill prompt only) ----
+        gpu_hit_tokens = 0
+        lmcache_by_tier: dict[str, int] = {}
+        total_cache_tokens = 0
+
+        req_id = request.request_id
+        load_spec = self.load_specs.pop(req_id, None)
+        if load_spec is not None:
+            gpu_hit_tokens = int(load_spec.vllm_cached_tokens)
+
+            if load_spec.lmcache_tier_hit_tokens is not None:
+                lmcache_by_tier = dict(load_spec.lmcache_tier_hit_tokens)
+
+            # vLLM full-hit quirk: if the lookup prompt is fully hit, vLLM recomputes 1 token.
+            recalc_penalty = 1 if load_spec.recalc_last_token else 0
+            if recalc_penalty and lmcache_by_tier:
+                max_k = max(lmcache_by_tier, key=lambda k: lmcache_by_tier[k])
+                lmcache_by_tier[max_k] = max(0, lmcache_by_tier[max_k] - 1)
+                recalc_penalty = 0
+
+            total_cache_tokens = max(
+                0, gpu_hit_tokens + sum(lmcache_by_tier.values()) - recalc_penalty
+            )
+
+        if return_params is None:
+            return_params = {}
+
+        return_params.update(
+            {
+                "gpu_hit_tokens": gpu_hit_tokens,
+                "lmcache_hit_tokens_by_tier": lmcache_by_tier,
+                "total_cache_tokens": total_cache_tokens,
+            }
+        )
 
         return False, return_params
     
