@@ -1353,7 +1353,6 @@ class LMCacheConnectorV1Impl:
         for finished_req_id in scheduler_output.finished_req_ids:
             self._request_trackers.pop(finished_req_id, None)
             self._unfinished_requests.pop(finished_req_id, None)
-            self.load_specs.pop(finished_req_id, None)
 
             if hasattr(self, "_lookup_id_by_req"):
                 self._lookup_id_by_req.pop(finished_req_id, None)
