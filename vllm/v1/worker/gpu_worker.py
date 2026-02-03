@@ -1121,7 +1121,7 @@ class Worker(WorkerBase):
             copy_ms = sum(v["copy_ms"] for v in vals) / len(vals)
             compute_ms = sum(v["compute_ms"] for v in vals) / len(vals)
 
-            return {
+            out = {
                 "mode": "avg",
                 "window": len(vals),
                 "forward_ms": float(forward_ms),
@@ -1129,6 +1129,9 @@ class Worker(WorkerBase):
                 "copy_ms": float(copy_ms),
                 "compute_ms": float(compute_ms),
             }
+            out.update(rank_meta)
+            return out
+
         return {"error": f"unknown mode={mode}"}
 
     def flush_lmcache_batch_timing(self):
