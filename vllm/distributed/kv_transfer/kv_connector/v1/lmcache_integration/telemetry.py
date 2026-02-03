@@ -86,6 +86,9 @@ class TimingRingBuffer:
 
     def all_events(self) -> List[BatchTimingEvents]:
         return list(self._buf)
+        
+    def clear(self) -> None:
+        self._buf.clear()
 
 
 

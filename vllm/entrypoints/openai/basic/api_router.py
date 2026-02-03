@@ -67,20 +67,56 @@ async def get_last_batch_timing(request: Request):
 
     if not per_rank:
         return JSONResponse(content={"available": False, "per_rank": [], "aggregate": None})
-    
-    def _mean(key: str) -> float:
-        xs = [float(r[key]) for r in per_rank if key in r]
-        return sum(xs) / len(xs) if xs else 0.0
+    stage_map = {}
+    for r in per_rank:
+        pp_rank = int(r.get("pp_rank", 0))
+        stage = stage_map.get(pp_rank)
+        if stage is None:
+            stage = {
+                "pp_rank": pp_rank,
+                "pp_size": int(r.get("pp_size", 1)),
+                "forward_ms": float(r.get("forward_ms", 0.0)),
+                "stall_ms": float(r.get("stall_ms", 0.0)),
+                "copy_ms": float(r.get("copy_ms", 0.0)),
+                "compute_ms": float(r.get("compute_ms", 0.0)),
+            }
+            stage_map[pp_rank] = stage
+        else:
+            stage["forward_ms"] = max(stage["forward_ms"], float(r.get("forward_ms", 0.0)))
+            stage["stall_ms"] = max(stage["stall_ms"], float(r.get("stall_ms", 0.0)))
+            stage["copy_ms"] = max(stage["copy_ms"], float(r.get("copy_ms", 0.0)))
+            stage["compute_ms"] = max(stage["compute_ms"], float(r.get("compute_ms", 0.0)))
 
-    aggregate = {
+    per_stage = [stage_map[k] for k in sorted(stage_map.keys())]
+
+    latency_sum = {
         "mode": "last",
-        "forward_ms": _mean("forward_ms"),
-        "stall_ms": _mean("stall_ms"),
-        "copy_ms": _mean("copy_ms"),
-        "compute_ms": _mean("compute_ms"),
+        "view": "latency_sum",
+        "forward_ms": float(sum(s["forward_ms"] for s in per_stage)),
+        "stall_ms": float(sum(s["stall_ms"] for s in per_stage)),
+        "copy_ms": float(sum(s["copy_ms"] for s in per_stage)),
+        "compute_ms": float(sum(s["compute_ms"] for s in per_stage)),
     }
 
-    return JSONResponse(content={"available": True, "per_rank": per_rank, "aggregate": aggregate})
+    makespan_max = {
+        "mode": "last",
+        "view": "makespan_max",
+        "forward_ms": float(max(s["forward_ms"] for s in per_stage)),
+        "stall_ms": float(max(s["stall_ms"] for s in per_stage)),
+        "copy_ms": float(max(s["copy_ms"] for s in per_stage)),
+        "compute_ms": float(max(s["compute_ms"] for s in per_stage)),
+    }
+
+    aggregate = {"mode": "last", "latency_sum": latency_sum, "makespan_max": makespan_max}
+
+    return JSONResponse(
+        content={
+            "available": True,
+            "per_rank": per_rank,
+            "per_stage": per_stage,
+            "aggregate": aggregate,
+        }
+    )
 
 
 @router.get("/get_batch_timing_average")
@@ -95,20 +131,65 @@ async def get_batch_timing_average(request: Request, last_n: int = 50):
     if not per_rank:
         return JSONResponse(content={"available": False, "per_rank": [], "aggregate": None})
 
-    def _mean(key: str) -> float:
-        xs = [float(r[key]) for r in per_rank if key in r]
-        return sum(xs) / len(xs) if xs else 0.0
+    windows = [r.get("window", None) for r in per_rank]
+    windows = [int(w) for w in windows if isinstance(w, int)]
+    common_window = int(min(windows)) if windows else 0
 
-    aggregate = {
+    stage_map = {}
+    for r in per_rank:
+        pp_rank = int(r.get("pp_rank", 0))
+        stage = stage_map.get(pp_rank)
+        if stage is None:
+            stage = {
+                "pp_rank": pp_rank,
+                "pp_size": int(r.get("pp_size", 1)),
+                "window": int(r.get("window", common_window)),
+                "forward_ms": float(r.get("forward_ms", 0.0)),
+                "stall_ms": float(r.get("stall_ms", 0.0)),
+                "copy_ms": float(r.get("copy_ms", 0.0)),
+                "compute_ms": float(r.get("compute_ms", 0.0)),
+            }
+            stage_map[pp_rank] = stage
+        else:
+            stage["forward_ms"] = max(stage["forward_ms"], float(r.get("forward_ms", 0.0)))
+            stage["stall_ms"] = max(stage["stall_ms"], float(r.get("stall_ms", 0.0)))
+            stage["copy_ms"] = max(stage["copy_ms"], float(r.get("copy_ms", 0.0)))
+            stage["compute_ms"] = max(stage["compute_ms"], float(r.get("compute_ms", 0.0)))
+            stage["window"] = min(stage["window"], int(r.get("window", common_window)))
+
+    per_stage = [stage_map[k] for k in sorted(stage_map.keys())]
+
+    latency_sum = {
         "mode": "avg",
-        "window": int(min(r.get("window", 0) for r in per_rank if isinstance(r.get("window", None), int)) or 0),
-        "forward_ms": _mean("forward_ms"),
-        "stall_ms": _mean("stall_ms"),
-        "copy_ms": _mean("copy_ms"),
-        "compute_ms": _mean("compute_ms"),
+        "view": "latency_sum",
+        "window": int(min(s.get("window", common_window) for s in per_stage) if per_stage else common_window),
+        "forward_ms": float(sum(s["forward_ms"] for s in per_stage)),
+        "stall_ms": float(sum(s["stall_ms"] for s in per_stage)),
+        "copy_ms": float(sum(s["copy_ms"] for s in per_stage)),
+        "compute_ms": float(sum(s["compute_ms"] for s in per_stage)),
     }
 
-    return JSONResponse(content={"available": True, "per_rank": per_rank, "aggregate": aggregate})
+    makespan_max = {
+        "mode": "avg",
+        "view": "makespan_max",
+        "window": int(min(s.get("window", common_window) for s in per_stage) if per_stage else common_window),
+        "forward_ms": float(max(s["forward_ms"] for s in per_stage)),
+        "stall_ms": float(max(s["stall_ms"] for s in per_stage)),
+        "copy_ms": float(max(s["copy_ms"] for s in per_stage)),
+        "compute_ms": float(max(s["compute_ms"] for s in per_stage)),
+    }
+
+    aggregate = {"mode": "avg", "latency_sum": latency_sum, "makespan_max": makespan_max}
+
+    return JSONResponse(
+        content={
+            "available": True,
+            "per_rank": per_rank,
+            "per_stage": per_stage,
+            "aggregate": aggregate,
+        }
+    )
+
 
 @router.get("/cache/duplication")
 async def get_cache_duplication_stats(
@@ -145,6 +226,16 @@ async def get_cache_duplication_stats(
             "hint": "This endpoint requires a vLLM v1 EngineCore client that supports call_utility_async/call_utility.",
         },
     )
+
+@router.post("/flush_batch_timing")
+async def flush_batch_timing(request: Request):
+    results = await engine_client(request).collective_rpc(
+        "flush_lmcache_batch_timing",
+        kwargs={},
+    )
+    per_rank = [r for r in results if r is not None]
+    ok = all(bool(r.get("ok", False)) for r in per_rank) if per_rank else False
+    return JSONResponse(content={"ok": ok, "per_rank": per_rank})
 
 def register_basic_api_routers(app: FastAPI):
     app.include_router(router)

@@ -1031,6 +1031,29 @@ class Worker(WorkerBase):
         lm_impl = getattr(kv_group, "_lmcache_engine", None)
         if lm_impl is None:
             return None
+        try:
+            tp = get_tp_group()
+            tp_rank = int(getattr(tp, "rank_in_group", 0))
+            tp_size = int(getattr(tp, "world_size", 1))
+        except Exception:
+            tp_rank, tp_size = 0, 1
+
+        try:
+            pp = get_pp_group()
+            pp_rank = int(getattr(pp, "rank_in_group", 0))
+            pp_size = int(getattr(pp, "world_size", 1))
+        except Exception:
+            pp_rank, pp_size = 0, 1
+
+        rank_meta = {
+            "rank": int(self.rank),
+            "local_rank": int(self.local_rank),
+            "tp_rank": tp_rank,
+            "tp_size": tp_size,
+            "pp_rank": pp_rank,
+            "pp_size": pp_size,
+        }
+
 
         if not hasattr(lm_impl, "get_timing_ring_buffer"):
             return None
@@ -1046,19 +1069,25 @@ class Worker(WorkerBase):
                 forward_ms = float(rec.forward_ms)
                 copy_ms = float(rec.copy_ms)
                 compute_ms = float(forward_ms - stall_ms)
-                return {
+                out = {
                     "forward_ms": forward_ms,
                     "stall_ms": stall_ms,
                     "copy_ms": copy_ms,
                     "compute_ms": compute_ms,
                 }
+                out.update(rank_meta)
+                return out
 
-            return {
+
+            out = {
                 "forward_ms": float(rec.forward_ms),
                 "stall_ms": float(rec.stall_ms),
                 "copy_ms": float(rec.copy_ms),
                 "compute_ms": float(rec.compute_ms),
             }
+            out.update(rank_meta)
+            return out
+
 
         if mode == "last":
             ev = ring.last_events()
@@ -1101,6 +1130,55 @@ class Worker(WorkerBase):
                 "compute_ms": float(compute_ms),
             }
         return {"error": f"unknown mode={mode}"}
+
+    def flush_lmcache_batch_timing(self):
+        model_runner = getattr(self, "model_runner", None)
+        if model_runner is None:
+            return {"ok": False, "reason": "no_model_runner"}
+
+        active = getattr(model_runner, "kv_connector", None)
+        kv_group = getattr(active, "kv_connector", None)
+        lm_impl = getattr(kv_group, "_lmcache_engine", None)
+        if lm_impl is None:
+            return {"ok": False, "reason": "no_lmcache_engine"}
+
+        if not hasattr(lm_impl, "get_timing_ring_buffer"):
+            return {"ok": False, "reason": "no_ring_buffer"}
+
+        ring = lm_impl.get_timing_ring_buffer()
+        if ring is None:
+            return {"ok": False, "reason": "ring_none"}
+
+        if hasattr(ring, "clear"):
+            ring.clear()
+        else:
+            buf = getattr(ring, "_buf", None)
+            if buf is not None and hasattr(buf, "clear"):
+                buf.clear()
+
+        try:
+            tp = get_tp_group()
+            tp_rank = int(getattr(tp, "rank_in_group", 0))
+            tp_size = int(getattr(tp, "world_size", 1))
+        except Exception:
+            tp_rank, tp_size = 0, 1
+
+        try:
+            pp = get_pp_group()
+            pp_rank = int(getattr(pp, "rank_in_group", 0))
+            pp_size = int(getattr(pp, "world_size", 1))
+        except Exception:
+            pp_rank, pp_size = 0, 1
+
+        return {
+            "ok": True,
+            "rank": int(self.rank),
+            "local_rank": int(self.local_rank),
+            "tp_rank": tp_rank,
+            "tp_size": tp_size,
+            "pp_rank": pp_rank,
+            "pp_size": pp_size,
+        }
 
     def get_lmcache_residency_snapshot(self) -> dict[str, Any]:
         model_runner = getattr(self, "model_runner", None)
