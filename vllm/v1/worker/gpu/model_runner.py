@@ -994,41 +994,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             finally:
                 # Always clear to prevent spillover into the next batch.
                 self._kv_stall_sink.clear_current()
-
-                    # Run PyTorch model in eager mode.
-                    positions = input_batch.positions
-                    if self.uses_mrope:
-                        assert input_batch.mrope_positions is not None
-                        positions = input_batch.mrope_positions
-                    with set_forward_context(
-                        input_batch.attn_metadata,
-                        self.vllm_config,
-                        num_tokens=input_batch.num_tokens_after_padding,
-                        # TODO(woosuk): Support piecewise CUDA graph.
-                        cudagraph_runtime_mode=CUDAGraphMode.NONE,
-                        num_tokens_across_dp=num_tokens_across_dp,
-                        slot_mapping=input_batch.slot_mappings,
-                    ):
-                        if timing_step is not None:
-                            timing_step.forward_start = torch.cuda.Event(enable_timing=True)
-                            timing_step.forward_start.record(timing_stream)
-
-                        self.kv_connector.pre_forward(scheduler_output)
-                        if timing_step is not None:
-                            timing_step.load_end = torch.cuda.Event(enable_timing=True)
-                            timing_step.load_end.record(timing_stream)
-                        hidden_states = self.model(
-                            input_ids=input_batch.input_ids,
-                            positions=positions,
-                            inputs_embeds=input_batch.inputs_embeds,
-                        )
-
-                        if timing_step is not None:
-                            timing_step.forward_end = torch.cuda.Event(enable_timing=True)
-                            timing_step.forward_end.record(timing_stream)
-                        if timing_step is not None and lm_impl is not None:
-                            self._kv_stall_ring.push_events(timing_step)
-                            self._kv_stall_sink.clear_current()
         kv_connector_output = self.kv_connector.post_forward(scheduler_output)
         self.execute_model_state = hidden_states, input_batch, kv_connector_output
         return None

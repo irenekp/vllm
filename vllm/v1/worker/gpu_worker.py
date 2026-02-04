@@ -9,7 +9,6 @@ from types import NoneType
 from typing import TYPE_CHECKING, Any, cast
 import torch.distributed as dist
 from vllm.telemetry.kv_stall_telemetry import finalize_step_timing
-from vllm.distributed.parallel_state import get_tp_group
 
 import numpy as np
 import torch
@@ -125,7 +124,6 @@ class Worker(WorkerBase):
 
         if self.use_v2_model_runner:
             logger.info_once("Using V2 Model Runner", scope="global")
-        self._kv_stall_telemetry = KvStallTelemetry(window_size=200)
 
 
     def sleep(self, level: int = 1) -> None:
