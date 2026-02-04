@@ -8,7 +8,10 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn as nn
-
+from vllm.telemetry.kv_stall_telemetry import (
+    TimingRingBuffer,
+    VLLMTimingSink,
+)
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.parallel_state import prepare_communication_buffer_for_model
@@ -174,6 +177,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # KV Connector if configured.
         self.kv_connector: KVConnector = NO_OP_KV_CONNECTOR
+        self._kv_stall_sink = VLLMTimingSink()
+        self._kv_stall_ring = TimingRingBuffer(
+            capacity=self.vllm_config.kv_transfer_config.get_from_extra_config(
+                "timing_ring_capacity", 256
+            ) if self.vllm_config.kv_transfer_config is not None else 256
+        )
+        self._telemetry_fallback_batch_id = 0
+
 
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
@@ -805,20 +816,33 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             return None, None
 
         active = getattr(self, "kv_connector", None)
-        kv_group = getattr(active, "kv_connector", None)
+        kv_group = getattr(active, "kv_connector", None) if active is not None else None
         if kv_group is None:
             return None, None
 
         lm_impl = getattr(kv_group, "_lmcache_engine", None)
         if lm_impl is None:
             return None, None
-        if not hasattr(lm_impl, "get_timing_sink"):
-            return None, None
 
-        sink = lm_impl.get_timing_sink()
-        if sink is None:
-            return None, None
-        return sink.start_step(), lm_impl
+        if hasattr(lm_impl, "set_timing_sink"):
+            lm_impl.set_timing_sink(self._kv_stall_sink)
+
+        timing_step = self._kv_stall_sink.start_step()
+
+        timing_step.batch_id = int(scheduler_output.scheduler_step)
+
+        timing_step.tp_rank = int(getattr(self.parallel_config, "tensor_parallel_rank", -1))
+        if timing_step.tp_rank < 0:
+            timing_step.tp_rank = int(getattr(self.parallel_config, "tp_rank", -1))
+
+        timing_step.is_prefill = True 
+        timing_step.num_tokens = int(getattr(scheduler_output, "total_num_scheduled_tokens", -1))
+
+        timing_step.num_layers = int(getattr(self.model_config, "num_hidden_layers", -1))
+        if timing_step.num_layers <= 0:
+            timing_step.num_layers = int(getattr(self.model_config, "num_layers", -1))
+
+        return timing_step, lm_impl
 
     @torch.inference_mode()
     def execute_model(
@@ -903,44 +927,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # FIXME(woosuk): Fix warmup for LoRA.
         timing_step, lm_impl = self._maybe_start_lmcache_timing_step(scheduler_output)
         timing_stream = torch.cuda.current_stream()
-        # Run model.
-        if use_cudagraph:
-            # Run CUDA graph.
-            # NOTE(woosuk): Here, we don't need to pass the input tensors,
-            # because they are already copied to the CUDA graph input buffers.
-            if timing_step is not None:
-                timing_step.forward_start = torch.cuda.Event(enable_timing=True)
-                timing_step.forward_start.record(timing_stream)
 
-            self.kv_connector.pre_forward(scheduler_output)
-            if timing_step is not None:
-                timing_step.load_end = torch.cuda.Event(enable_timing=True)
-                timing_step.load_end.record(timing_stream)
-            hidden_states = self.cudagraph_manager.run(
-                input_batch.num_tokens_after_padding
-            )
-
-            if timing_step is not None:
-                timing_step.forward_end = torch.cuda.Event(enable_timing=True)
-                timing_step.forward_end.record(timing_stream)
-            if timing_step is not None and lm_impl is not None:
-                lm_impl.get_timing_ring_buffer().push_events(timing_step)
-                lm_impl.get_timing_sink().clear_current()
-        else:
-            # Run PyTorch model in eager mode.
-            positions = input_batch.positions
-            if self.uses_mrope:
-                assert input_batch.mrope_positions is not None
-                positions = input_batch.mrope_positions
-            with set_forward_context(
-                input_batch.attn_metadata,
-                self.vllm_config,
-                num_tokens=input_batch.num_tokens_after_padding,
-                # TODO(woosuk): Support piecewise CUDA graph.
-                cudagraph_runtime_mode=CUDAGraphMode.NONE,
-                num_tokens_across_dp=num_tokens_across_dp,
-                slot_mapping=input_batch.slot_mappings,
-            ):
+        try:
+            # Run model.
+            if use_cudagraph:
+                # Run CUDA graph.
+                # NOTE(woosuk): Here, we don't need to pass the input tensors,
+                # because they are already copied to the CUDA graph input buffers.
                 if timing_step is not None:
                     timing_step.forward_start = torch.cuda.Event(enable_timing=True)
                     timing_step.forward_start.record(timing_stream)
@@ -949,19 +942,93 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 if timing_step is not None:
                     timing_step.load_end = torch.cuda.Event(enable_timing=True)
                     timing_step.load_end.record(timing_stream)
-                hidden_states = self.model(
-                    input_ids=input_batch.input_ids,
-                    positions=positions,
-                    inputs_embeds=input_batch.inputs_embeds,
+
+                hidden_states = self.cudagraph_manager.run(
+                    input_batch.num_tokens_after_padding
                 )
 
                 if timing_step is not None:
                     timing_step.forward_end = torch.cuda.Event(enable_timing=True)
                     timing_step.forward_end.record(timing_stream)
-                if timing_step is not None and lm_impl is not None:
-                    lm_impl.get_timing_ring_buffer().push_events(timing_step)
-                    lm_impl.get_timing_sink().clear_current()
 
+            else:
+                # Run PyTorch model in eager mode.
+                positions = input_batch.positions
+                if self.uses_mrope:
+                    assert input_batch.mrope_positions is not None
+                    positions = input_batch.mrope_positions
+
+                with set_forward_context(
+                    input_batch.attn_metadata,
+                    self.vllm_config,
+                    num_tokens=input_batch.num_tokens_after_padding,
+                    # TODO(woosuk): Support piecewise CUDA graph.
+                    cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    slot_mapping=input_batch.slot_mappings,
+                ):
+                    if timing_step is not None:
+                        timing_step.forward_start = torch.cuda.Event(enable_timing=True)
+                        timing_step.forward_start.record(timing_stream)
+
+                    self.kv_connector.pre_forward(scheduler_output)
+                    if timing_step is not None:
+                        timing_step.load_end = torch.cuda.Event(enable_timing=True)
+                        timing_step.load_end.record(timing_stream)
+
+                    hidden_states = self.model(
+                        input_ids=input_batch.input_ids,
+                        positions=positions,
+                        inputs_embeds=input_batch.inputs_embeds,
+                    )
+
+                    if timing_step is not None:
+                        timing_step.forward_end = torch.cuda.Event(enable_timing=True)
+                        timing_step.forward_end.record(timing_stream)
+
+        finally:
+            # Push only if we have a complete timing record (prevents half-formed entries).
+            try:
+                if timing_step is not None and timing_step.forward_start is not None and timing_step.forward_end is not None:
+                    self._kv_stall_ring.push_events(timing_step)
+            finally:
+                # Always clear to prevent spillover into the next batch.
+                self._kv_stall_sink.clear_current()
+
+                    # Run PyTorch model in eager mode.
+                    positions = input_batch.positions
+                    if self.uses_mrope:
+                        assert input_batch.mrope_positions is not None
+                        positions = input_batch.mrope_positions
+                    with set_forward_context(
+                        input_batch.attn_metadata,
+                        self.vllm_config,
+                        num_tokens=input_batch.num_tokens_after_padding,
+                        # TODO(woosuk): Support piecewise CUDA graph.
+                        cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                        num_tokens_across_dp=num_tokens_across_dp,
+                        slot_mapping=input_batch.slot_mappings,
+                    ):
+                        if timing_step is not None:
+                            timing_step.forward_start = torch.cuda.Event(enable_timing=True)
+                            timing_step.forward_start.record(timing_stream)
+
+                        self.kv_connector.pre_forward(scheduler_output)
+                        if timing_step is not None:
+                            timing_step.load_end = torch.cuda.Event(enable_timing=True)
+                            timing_step.load_end.record(timing_stream)
+                        hidden_states = self.model(
+                            input_ids=input_batch.input_ids,
+                            positions=positions,
+                            inputs_embeds=input_batch.inputs_embeds,
+                        )
+
+                        if timing_step is not None:
+                            timing_step.forward_end = torch.cuda.Event(enable_timing=True)
+                            timing_step.forward_end.record(timing_stream)
+                        if timing_step is not None and lm_impl is not None:
+                            self._kv_stall_ring.push_events(timing_step)
+                            self._kv_stall_sink.clear_current()
         kv_connector_output = self.kv_connector.post_forward(scheduler_output)
         self.execute_model_state = hidden_states, input_batch, kv_connector_output
         return None
@@ -1031,3 +1098,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         return self.draft_tokens_handler.get_draft_tokens()
+
+    def get_kv_stall_ring(self) -> TimingRingBuffer:
+        return self._kv_stall_ring
+
+    def get_kv_stall_sink(self) -> VLLMTimingSink:
+        return self._kv_stall_sink

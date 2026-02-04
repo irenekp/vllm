@@ -237,10 +237,14 @@ class SchedulerOutput:
 
     # EC Cache Connector metadata
     ec_connector_metadata: ECConnectorMetadata | None = None
+    # Monotonic scheduling iteration id assigned by the Scheduler.
+    # This is the canonical "batch id" for telemetry and is consistent across TP ranks.
+    scheduler_step: int
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(
+            scheduler_step=-1,
             scheduled_new_reqs=[],
             scheduled_cached_reqs=CachedRequestData.make_empty(),
             num_scheduled_tokens={},
@@ -251,6 +255,7 @@ class SchedulerOutput:
             finished_req_ids=set(),
             free_encoder_mm_hashes=[],
         )
+
 
 
 @dataclass

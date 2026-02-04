@@ -7,6 +7,9 @@ import os
 from contextlib import AbstractContextManager, nullcontext
 from types import NoneType
 from typing import TYPE_CHECKING, Any, cast
+import torch.distributed as dist
+from vllm.telemetry.kv_stall_telemetry import finalize_step_timing
+from vllm.distributed.parallel_state import get_tp_group
 
 import numpy as np
 import torch
@@ -59,9 +62,8 @@ from vllm.v1.worker.worker_base import WorkerBase
 from vllm.v1.worker.workspace import init_workspace_manager
 
 from .utils import request_memory
-from vllm.distributed.kv_transfer.kv_connector.v1.lmcache_integration.telemetry import (
-    finalize_step_timing,
-)
+from vllm.telemetry.kv_stall_telemetry import finalize_step_timing
+
 logger = init_logger(__name__)
 
 if TYPE_CHECKING:
@@ -120,6 +122,11 @@ class Worker(WorkerBase):
             self.profiler = None
 
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
+
+        if self.use_v2_model_runner:
+            logger.info_once("Using V2 Model Runner", scope="global")
+        self._kv_stall_telemetry = KvStallTelemetry(window_size=200)
+
 
     def sleep(self, level: int = 1) -> None:
         from vllm.device_allocator.cumem import CuMemAllocator
@@ -1022,166 +1029,119 @@ class Worker(WorkerBase):
         if weight_transfer_engine := getattr(self, "weight_transfer_engine", None):
             weight_transfer_engine.shutdown()
 
-    def get_lmcache_batch_timing(self, mode: str = "last", last_n: int = 50):
+    def get_lmcache_batch_timing(
+        self,
+        mode: str = "avg",
+        window_size: int = 10,
+        block: bool = True,
+    ):
         model_runner = getattr(self, "model_runner", None)
-        if model_runner is None:
-            return None
-        active = getattr(model_runner, "kv_connector", None)
-        kv_group = getattr(active, "kv_connector", None)
-        lm_impl = getattr(kv_group, "_lmcache_engine", None)
-        if lm_impl is None:
-            return None
-        try:
-            tp = get_tp_group()
-            tp_rank = int(getattr(tp, "rank_in_group", 0))
-            tp_size = int(getattr(tp, "world_size", 1))
-        except Exception:
-            tp_rank, tp_size = 0, 1
-
-        try:
-            pp = get_pp_group()
-            pp_rank = int(getattr(pp, "rank_in_group", 0))
-            pp_size = int(getattr(pp, "world_size", 1))
-        except Exception:
-            pp_rank, pp_size = 0, 1
-
-        rank_meta = {
-            "rank": int(self.rank),
-            "local_rank": int(self.local_rank),
-            "tp_rank": tp_rank,
-            "tp_size": tp_size,
-            "pp_rank": pp_rank,
-            "pp_size": pp_size,
-        }
-
-
-        if not hasattr(lm_impl, "get_timing_ring_buffer"):
+        if model_runner is None or not hasattr(model_runner, "get_kv_stall_ring"):
             return None
 
-        ring = lm_impl.get_timing_ring_buffer()
+        ring = model_runner.get_kv_stall_ring()
+        if ring is None:
+            return None
+        tp_group = None
+        if dist.is_available() and dist.is_initialized():
+            try:
+                tp_group = get_tp_group().device_group
+            except Exception:
+                tp_group = dist.group.WORLD
+
         def _finalize_one(ev):
-            rec = finalize_step_timing(ev, block=True)
+            rec = finalize_step_timing(ev, block=block, tp_group=tp_group, tp_reduce_max=True)
             if rec is None:
                 return None
-            if (not ev.stall_intervals) and (ev.forward_start is not None) and (ev.load_end is not None):
-                load_ms = ev.forward_start.elapsed_time(ev.load_end)
-                stall_ms = float(load_ms)
-                forward_ms = float(rec.forward_ms)
-                copy_ms = float(rec.copy_ms)
-                compute_ms = float(forward_ms - stall_ms)
-                out = {
-                    "forward_ms": forward_ms,
-                    "stall_ms": stall_ms,
-                    "copy_ms": copy_ms,
-                    "compute_ms": compute_ms,
-                }
-                out.update(rank_meta)
-                return out
+            return {
+                "batch_id": rec.batch_id,
+                "tp_rank": rec.tp_rank,
+                "is_prefill": rec.is_prefill,
+                "num_tokens": rec.num_tokens,
+                "num_layers": rec.num_layers,
 
+                "valid": rec.valid,
+                "reason": rec.reason,
+                "tp_reduced": rec.tp_reduced,
+                "reported_layers": rec.reported_layers,
+                "missing_layers": rec.missing_layers,
+                "unattributed_layer_intervals": rec.unattributed_layer_intervals,
+                "out_of_range_layer_intervals": rec.out_of_range_layer_intervals,
 
-            out = {
-                "forward_ms": float(rec.forward_ms),
-                "stall_ms": float(rec.stall_ms),
-                "copy_ms": float(rec.copy_ms),
-                "compute_ms": float(rec.compute_ms),
+                "forward_ms": rec.forward_ms,
+                "stall_ms": rec.stall_ms,
+                "stall_ms_unattributed": rec.stall_ms_unattributed,
+                "stall_ms_by_layer": rec.stall_ms_by_layer,
+
+                "copy_ms": rec.copy_ms,
+                "compute_ms": rec.compute_ms,
+                "stall_pct": (rec.stall_ms / rec.forward_ms) if rec.forward_ms > 0 else 0.0,
             }
-            out.update(rank_meta)
-            return out
 
-
-        if mode == "last":
-            ev = ring.last_events()
-            if ev is None:
+        if mode in ("last", "debug_last"):
+            last_ev = ring.last_events()
+            if last_ev is None:
                 return None
-            out = _finalize_one(ev)
+            out = _finalize_one(last_ev)
             if out is None:
                 return None
-            out["mode"] = "last"
+
+            if mode == "debug_last":
+                # Provide a compact per-layer summary (top 10 layers by stall)
+                stalls = out.get("stall_ms_by_layer", []) or []
+                indexed = list(enumerate(stalls))
+                indexed.sort(key=lambda x: x[1], reverse=True)
+                out["top_layers_by_stall"] = indexed[:10]
+                out["stall_ms_by_layer_sum_check"] = float(sum(stalls) + float(out.get("stall_ms_unattributed", 0.0)))
             return out
+
+        events = ring.all_events()
+        if not events:
+            return None
 
         if mode == "avg":
-            all_ev = ring.all_events()
-            if not all_ev:
-                return None
-
-            n = max(1, min(int(last_n), len(all_ev)))
-            window = all_ev[-n:]
-
-            vals = []
-            for ev in window:
-                rec = _finalize_one(ev)
-                if rec is not None:
-                    vals.append(rec)
-
-            if not vals:
-                return None
-
-            forward_ms = sum(v["forward_ms"] for v in vals) / len(vals)
-            stall_ms = sum(v["stall_ms"] for v in vals) / len(vals)
-            copy_ms = sum(v["copy_ms"] for v in vals) / len(vals)
-            compute_ms = sum(v["compute_ms"] for v in vals) / len(vals)
-
-            out = {
-                "mode": "avg",
-                "window": len(vals),
-                "forward_ms": float(forward_ms),
-                "stall_ms": float(stall_ms),
-                "copy_ms": float(copy_ms),
-                "compute_ms": float(compute_ms),
-            }
-            out.update(rank_meta)
-            return out
-
-        return {"error": f"unknown mode={mode}"}
-
-    def flush_lmcache_batch_timing(self):
-        model_runner = getattr(self, "model_runner", None)
-        if model_runner is None:
-            return {"ok": False, "reason": "no_model_runner"}
-
-        active = getattr(model_runner, "kv_connector", None)
-        kv_group = getattr(active, "kv_connector", None)
-        lm_impl = getattr(kv_group, "_lmcache_engine", None)
-        if lm_impl is None:
-            return {"ok": False, "reason": "no_lmcache_engine"}
-
-        if not hasattr(lm_impl, "get_timing_ring_buffer"):
-            return {"ok": False, "reason": "no_ring_buffer"}
-
-        ring = lm_impl.get_timing_ring_buffer()
-        if ring is None:
-            return {"ok": False, "reason": "ring_none"}
-
-        if hasattr(ring, "clear"):
-            ring.clear()
+            events = events[-max(1, int(window_size)):]
+        elif mode == "global_avg":
+            pass
         else:
-            buf = getattr(ring, "_buf", None)
-            if buf is not None and hasattr(buf, "clear"):
-                buf.clear()
+            return None
 
-        try:
-            tp = get_tp_group()
-            tp_rank = int(getattr(tp, "rank_in_group", 0))
-            tp_size = int(getattr(tp, "world_size", 1))
-        except Exception:
-            tp_rank, tp_size = 0, 1
+        records = []
+        for ev in events:
+            r = _finalize_one(ev)
+            if r is not None:
+                records.append(r)
 
-        try:
-            pp = get_pp_group()
-            pp_rank = int(getattr(pp, "rank_in_group", 0))
-            pp_size = int(getattr(pp, "world_size", 1))
-        except Exception:
-            pp_rank, pp_size = 0, 1
+        if not records:
+            return None
+
+        def _mean(key: str) -> float:
+            return float(sum(r[key] for r in records) / len(records))
 
         return {
-            "ok": True,
-            "rank": int(self.rank),
-            "local_rank": int(self.local_rank),
-            "tp_rank": tp_rank,
-            "tp_size": tp_size,
-            "pp_rank": pp_rank,
-            "pp_size": pp_size,
+            "num_samples": len(records),
+            "forward_ms": _mean("forward_ms"),
+            "stall_ms": _mean("stall_ms"),
+            "copy_ms": _mean("copy_ms"),
+            "compute_ms": _mean("compute_ms"),
+            "stall_pct": _mean("stall_pct"),
+            "valid_frac": float(sum(1 for r in records if r.get("valid", False)) / len(records)),
         }
+
+    def flush_lmcache_batch_timing(self):
+        """
+        Clears the vLLM-owned KV-stall timing ring buffer on this worker.
+        """
+        model_runner = getattr(self, "model_runner", None)
+        if model_runner is None or not hasattr(model_runner, "get_kv_stall_ring"):
+            return {"ok": False, "reason": "no_model_runner_or_ring"}
+
+        ring = model_runner.get_kv_stall_ring()
+        if ring is None:
+            return {"ok": False, "reason": "no_ring"}
+
+        ring.clear()
+        return {"ok": True}
 
     def get_lmcache_residency_snapshot(self) -> dict[str, Any]:
         model_runner = getattr(self, "model_runner", None)
