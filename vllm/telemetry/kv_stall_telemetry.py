@@ -125,6 +125,31 @@ class TimingRingBuffer:
     def clear(self) -> None:
         self._buf.clear()
 
+    def get_last_where(self, pred):
+        with self._lock:
+            n = len(self._buf)
+            for i in range(1, n + 1):
+                r = self._buf[-i]
+                if pred(r):
+                    return r
+        return None
+    
+    def latest(self):
+    """Return most recent record, or None."""
+    with self._lock:
+        if not self._buf:
+            return None
+        return self._buf[-1]
+
+    def latest_prefill(self):
+        """Return most recent prefill record, or None."""
+        with self._lock:
+            for r in reversed(self._buf):
+                if getattr(r, "is_prefill", False):
+                    return r
+        return None
+
+
 
 def _sum_intervals_ms(intervals: List[CudaEventInterval]) -> float:
     total = 0.0

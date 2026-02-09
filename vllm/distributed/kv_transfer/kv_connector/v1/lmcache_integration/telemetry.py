@@ -90,6 +90,16 @@ class TimingRingBuffer:
     def clear(self) -> None:
         self._buf.clear()
 
+    def get_last_where(self, pred):
+        with self._lock:
+            n = len(self._buf)
+            for i in range(1, n + 1):
+                r = self._buf[-i]
+                if pred(r):
+                    return r
+        return None
+
+
 
 
 def _sum_intervals_ms(intervals: List[CudaEventInterval]) -> float:

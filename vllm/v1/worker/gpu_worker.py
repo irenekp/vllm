@@ -1032,7 +1032,10 @@ class Worker(WorkerBase):
         mode: str = "avg",
         window_size: int = 10,
         block: bool = True,
+        last_n: int | None = None,
     ):
+        if last_n is not None:
+            window_size = int(last_n)
         model_runner = getattr(self, "model_runner", None)
         if model_runner is None or not hasattr(model_runner, "get_kv_stall_ring"):
             return None
