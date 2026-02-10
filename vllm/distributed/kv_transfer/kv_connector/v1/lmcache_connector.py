@@ -8,6 +8,7 @@ import torch
 from vllm.config import VllmConfig
 from vllm.distributed.kv_events import (
     BlockStored,
+    BlockRemoved,
     KVCacheEvent,
     KVConnectorKVEvents,
     KVEventAggregator,
@@ -44,9 +45,9 @@ class LMCacheKVEvents(KVConnectorKVEvents):
 
     def aggregate(self) -> "LMCacheKVEvents":
         """
-        Aggregate KV events and retain only common events.
+        Aggregate KV events across workers.
         """
-        common_events = self._aggregator.get_common_events()
+        common_events = self._aggregator.get_all_events()
         self._aggregator.clear_events()
         self._aggregator.add_events(common_events)
         self._aggregator.reset_workers()
@@ -226,18 +227,27 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
         if not events:
             return None
 
-        blocks: list[BlockStored] = [
-            BlockStored(
-                block_hashes=e.block_hashes,
-                parent_block_hash=e.parent_block_hash,
-                token_ids=e.token_ids,
-                lora_id=e.lora_id,
-                block_size=e.block_size,
-                medium=e.medium,
-                lora_name=getattr(e, "lora_name", None),
-            )
-            for e in events
-        ]
+        blocks: list[KVCacheEvent] = []
+        for e in events:
+            if hasattr(e, "parent_block_hash"):
+                blocks.append(
+                    BlockStored(
+                        block_hashes=e.block_hashes,
+                        parent_block_hash=e.parent_block_hash,
+                        token_ids=e.token_ids,
+                        lora_id=getattr(e, "lora_id", None),
+                        block_size=e.block_size,
+                        medium=e.medium,
+                        lora_name=getattr(e, "lora_name", None),
+                    )
+                )
+            else:
+                blocks.append(
+                    BlockRemoved(
+                        block_hashes=e.block_hashes,
+                        medium=e.medium,
+                    )
+                )
 
         lmcache_kv_events = LMCacheKVEvents(num_workers=1)
         lmcache_kv_events.add_events(blocks)

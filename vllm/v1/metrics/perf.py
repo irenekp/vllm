@@ -11,7 +11,7 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass
-from typing import Any, Protocol
+from typing import Any, Protocol, TYPE_CHECKING
 
 import torch
 from pydantic import BaseModel, Field, ValidationError, model_validator
@@ -25,7 +25,8 @@ from vllm.utils.torch_utils import (
     get_dtype_size,
     get_kv_cache_torch_dtype,
 )
-from vllm.v1.core.sched.output import SchedulerOutput
+if TYPE_CHECKING:
+    from vllm.v1.core.sched.output import SchedulerOutput
 
 logger = init_logger(__name__)
 
@@ -1028,7 +1029,7 @@ class ModelMetrics:
         return total
 
     def get_step_perf_stats_per_gpu(
-        self, scheduler_output: SchedulerOutput
+        self, scheduler_output: "SchedulerOutput"
     ) -> PerfStats:
         """
         Calculate perf stats for the current step based on scheduled tokens.

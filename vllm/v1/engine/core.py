@@ -34,9 +34,7 @@ from vllm.utils.hashing import get_hash_fn_by_name
 from vllm.utils.network_utils import make_zmq_socket
 from vllm.utils.system_utils import decorate_logs, set_process_title
 from vllm.v1.core.kv_cache_utils import (
-    BlockHash,
     generate_scheduler_kv_cache_config,
-    get_block_hash,
     get_kv_cache_configs,
     get_request_block_hasher,
     init_none_hash,
@@ -594,6 +592,9 @@ class EngineCore:
             reset_running_requests, reset_connector
         )
 
+    def get_kv_duplication_stats(self) -> dict[str, Any]:
+        return self.scheduler.get_kv_duplication_stats()
+
     def reset_encoder_cache(self) -> None:
         """Reset the encoder cache to invalidate all cached encoder outputs.
 
@@ -656,177 +657,6 @@ class EngineCore:
         kwargs: dict[str, Any] | None = None,
     ) -> list[_R]:
         return self.model_executor.collective_rpc(method, timeout, args, kwargs)
-
-    def get_cache_duplication_stats(
-        self,
-        per_worker: bool = True,
-        include_lmcache_internal: bool = True,
-    ) -> dict[str, Any]:
-        def _normalize_hash_to_u64(x: Any) -> int | None:
-            if x is None:
-                return None
-            try:
-                if isinstance(x, (bytes, bytearray, memoryview)):
-                    b = bytes(x)
-                    # keep low 64 bits
-                    if len(b) >= 8:
-                        b = b[-8:]
-                    else:
-                        b = b.rjust(8, b"\x00")
-                    return int.from_bytes(b, byteorder="big", signed=False)
-                if isinstance(x, int):
-                    return x & ((1 << 64) - 1)
-                return int(x) & ((1 << 64) - 1)
-            except Exception:
-                return None
-
-        block_size_tokens = getattr(self.scheduler, "block_size", None)
-        if block_size_tokens is None:
-            raise RuntimeError("Scheduler does not expose block_size; cannot compute stats.")
-
-        try:
-            cache_map = (
-                self.scheduler.kv_cache_manager.block_pool.cached_block_hash_to_block._cache
-            )
-        except Exception as e:
-            raise RuntimeError(
-                f"Unable to access vLLM prefix cache map for stats: {e}"
-            ) from e
-
-        vllm_prefix_cache_entries = len(cache_map)
-
-        vllm_block_hash_u64: set[int] = set()
-        for bh_with_group in cache_map.keys():
-            bh: BlockHash = get_block_hash(bh_with_group)
-            h = _normalize_hash_to_u64(bh)
-            if h is not None:
-                vllm_block_hash_u64.add(h)
-
-        worker_snaps: list[dict[str, Any]] = self.collective_rpc(
-            "get_lmcache_residency_snapshot"
-        )
-
-        lmcache_chunk_sizes = {
-            ws.get("chunk_size_tokens")
-            for ws in worker_snaps
-            if ws.get("enabled") and ws.get("chunk_size_tokens") is not None
-        }
-        lmcache_chunk_size_tokens = None
-        if lmcache_chunk_sizes:
-            if len(lmcache_chunk_sizes) != 1:
-                raise RuntimeError(
-                    f"Inconsistent LMCache chunk_size_tokens across workers: {sorted(lmcache_chunk_sizes)}"
-                )
-            lmcache_chunk_size_tokens = next(iter(lmcache_chunk_sizes))
-
-        if lmcache_chunk_size_tokens is not None:
-            if lmcache_chunk_size_tokens % block_size_tokens != 0:
-                raise RuntimeError(
-                    "LMCache chunk_size_tokens must be a multiple of vLLM block_size_tokens "
-                    f"(got chunk_size_tokens={lmcache_chunk_size_tokens}, block_size_tokens={block_size_tokens})."
-                )
-
-        global_by_tier: dict[str, dict[str, int]] = {}
-        global_internal_pairs: dict[str, dict[str, int]] = {}
-        global_unsupported: set[str] = set()
-
-        per_worker_out: dict[str, Any] = {}
-
-        for ws in worker_snaps:
-            worker_id = ws.get("worker_id", -1)
-            enabled = bool(ws.get("enabled", False))
-            tiers = ws.get("tiers", {}) or {}
-            unsupported = ws.get("unsupported_tiers", []) or []
-            for t in unsupported:
-                global_unsupported.add(str(t))
-            tier_sets: dict[str, set[int]] = {}
-            for tier_name, vals in tiers.items():
-                if not isinstance(vals, list):
-                    continue
-                tier_sets[str(tier_name)] = set(int(v) for v in vals)
-
-            by_tier: dict[str, dict[str, int]] = {}
-            for tier_name, tset in tier_sets.items():
-                in_tier = len(tset)
-                in_both = len(tset.intersection(vllm_block_hash_u64))
-                only_tier = in_tier - in_both
-
-                by_tier[tier_name] = {
-                    "lmcache_chunks": in_tier,
-                    "chunks_in_both_with_vllm": in_both,
-                    "lmcache_only_chunks": only_tier,
-                }
-
-                agg = global_by_tier.setdefault(
-                    tier_name,
-                    {"lmcache_chunks": 0, "chunks_in_both_with_vllm": 0, "lmcache_only_chunks": 0},
-                )
-                agg["lmcache_chunks"] += in_tier
-                agg["chunks_in_both_with_vllm"] += in_both
-                agg["lmcache_only_chunks"] += only_tier
-
-            internal_pairs: dict[str, dict[str, int]] = {}
-            if include_lmcache_internal and len(tier_sets) >= 2:
-                from itertools import combinations
-
-                tier_names = sorted(tier_sets.keys())
-                for a, b in combinations(tier_names, 2):
-                    inter = len(tier_sets[a].intersection(tier_sets[b]))
-                    key = f"{a}__{b}"
-                    internal_pairs[key] = {"chunks_in_both_tiers": inter}
-
-                    g = global_internal_pairs.setdefault(key, {"chunks_in_both_tiers": 0})
-                    g["chunks_in_both_tiers"] += inter
-
-            if per_worker:
-                per_worker_out[str(worker_id)] = {
-                    "worker_id": worker_id,
-                    "lmcache_enabled": enabled,
-                    "chunk_size_tokens": ws.get("chunk_size_tokens"),
-                    "engine_count": ws.get("engine_count", 0),
-                    "unsupported_tiers": sorted(set(str(t) for t in unsupported)),
-                    "by_tier": by_tier,
-                    "lmcache_internal": internal_pairs,
-                }
-
-        def _to_tokens(num_chunks: int) -> int | None:
-            if lmcache_chunk_size_tokens is None:
-                return None
-            return int(num_chunks) * int(lmcache_chunk_size_tokens)
-
-        global_by_tier_tokens: dict[str, dict[str, int | None]] = {}
-        for tier_name, counts in global_by_tier.items():
-            global_by_tier_tokens[tier_name] = {
-                "lmcache_tokens": _to_tokens(counts["lmcache_chunks"]),
-                "tokens_in_both_with_vllm": _to_tokens(counts["chunks_in_both_with_vllm"]),
-                "lmcache_only_tokens": _to_tokens(counts["lmcache_only_chunks"]),
-            }
-
-        global_internal_pairs_tokens: dict[str, dict[str, int | None]] = {}
-        for pair_name, counts in global_internal_pairs.items():
-            global_internal_pairs_tokens[pair_name] = {
-                "tokens_in_both_tiers": _to_tokens(counts["chunks_in_both_tiers"]),
-            }
-
-        return {
-            "vllm": {
-                "block_size_tokens": block_size_tokens,
-                "gpu_prefix_cache_entries": vllm_prefix_cache_entries,
-                "gpu_prefix_cache_unique_block_hashes": len(vllm_block_hash_u64),
-                "gpu_prefix_cache_tokens_estimate": int(vllm_prefix_cache_entries) * int(block_size_tokens),
-            },
-            "lmcache": {
-                "chunk_size_tokens": lmcache_chunk_size_tokens,
-                "unsupported_tiers": sorted(global_unsupported),
-            },
-            "duplication": {
-                "by_tier_global": global_by_tier,
-                "by_tier_global_tokens": global_by_tier_tokens,
-                "lmcache_internal_global": global_internal_pairs,
-                "lmcache_internal_global_tokens": global_internal_pairs_tokens,
-            },
-            "per_worker": per_worker_out if per_worker else None
-        }
 
     def preprocess_add_request(self, request: EngineCoreRequest) -> tuple[Request, int]:
         """Preprocess the request.

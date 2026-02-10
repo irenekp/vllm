@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Standard
 import os
+import threading
 import uuid
 from collections.abc import Generator
 from dataclasses import dataclass, field
@@ -12,7 +13,7 @@ from lmcache import utils
 from lmcache.config import LMCacheEngineMetadata
 from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor
-from lmcache.utils import _lmcache_nvtx_annotate
+from lmcache.utils import CacheEvictEvent, CacheStoreEvent, _lmcache_nvtx_annotate
 from lmcache.v1.cache_engine import LMCacheEngine, LMCacheEngineBuilder
 from lmcache.v1.compute.blend import LMCBlenderBuilder
 from lmcache.v1.config import LMCacheEngineConfig, _validate_and_set_config_value
@@ -67,6 +68,15 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+
+def _split_tier_stats(tier_stats: Any) -> dict[str, int]:
+    if not isinstance(tier_stats, dict):
+        return {}
+    min_payload = tier_stats.get("min")
+    if isinstance(min_payload, dict):
+        return dict(min_payload)
+    return dict(tier_stats)
 
 
 @dataclass
@@ -135,6 +145,8 @@ class RequestTracker:
     # The block ids that has been allocated so far
     # NOTE: allocated blocks could be more than the number of tokens
     allocated_block_ids: list[int]
+    # The vLLM block hashes corresponding to full blocks.
+    block_hashes: list[Any] = field(default_factory=list)
 
     # The number of tokens that has been saved
     num_saved_tokens: int = 0
@@ -207,6 +219,7 @@ class RequestTracker:
             prompt_len=len(new_request.prompt_token_ids),
             token_ids=new_request.prompt_token_ids[:num_tokens_to_compute].copy(),
             allocated_block_ids=unfolded_block_ids,
+            block_hashes=list(new_request.block_hashes or []),
             num_saved_tokens=lmcache_cached_tokens,
             disagg_spec=disagg_spec,
             mm_hashes=mm_hashes,
@@ -269,6 +282,8 @@ class ReqMeta:
     disagg_spec: DisaggSpec | None = None
     # the configs of the request
     request_configs: dict | None = None
+    # vLLM block hashes aligned with chunk indices (full blocks only)
+    block_hashes: list[Any] | None = None
 
     @staticmethod
     def from_request_tracker(
@@ -399,6 +414,7 @@ class ReqMeta:
             load_spec=load_spec,
             disagg_spec=tracker.disagg_spec,
             request_configs=tracker.request_configs,
+            block_hashes=tracker.block_hashes,
         )
 
 
@@ -690,6 +706,10 @@ class LMCacheConnectorV1Impl:
         self.force_skip_save = bool(os.environ.get("LMCACHE_FORCE_SKIP_SAVE", False))
 
         self._requests_priority: dict[str, int] = {}
+        # Map LMCache chunk hash to vLLM block hash for duplication tracking.
+        self._hash_translation: dict[int, Any] = {}
+        self._hash_translation_sizes: dict[int, int] = {}
+        self._hash_translation_lock = threading.Lock()
 
         # TODO(baoloongmao): Internal api server & plugin framework support
         # dp > 1
@@ -1021,6 +1041,13 @@ class LMCacheConnectorV1Impl:
                     request.req_id,
                 )
 
+                self._record_hash_translation(
+                    token_ids=token_ids,
+                    store_mask=store_mask,
+                    block_hashes=request.block_hashes,
+                    request_configs=request.request_configs,
+                )
+
                 # TODO (Jiayi): need to make layerwise storing
                 # compatible with disagg spec
                 layerwise_storer = self.lmcache_engine.store_layer(
@@ -1123,6 +1150,13 @@ class LMCacheConnectorV1Impl:
                 store_mask = store_mask[:aligned_token_len]
                 slot_mapping = slot_mapping[:aligned_token_len]
 
+            self._record_hash_translation(
+                token_ids=token_ids,
+                store_mask=store_mask,
+                block_hashes=request.block_hashes,
+                request_configs=request.request_configs,
+            )
+
             self.lmcache_engine.store(
                 token_ids,
                 mask=store_mask,
@@ -1143,6 +1177,86 @@ class LMCacheConnectorV1Impl:
         self, finished_req_ids: set[str]
     ) -> tuple[set[str] | None, set[str] | None]:
         return None, None
+
+    def _record_hash_translation(
+        self,
+        token_ids: list[int],
+        store_mask: torch.Tensor,
+        block_hashes: list[Any] | None,
+        request_configs: dict | None,
+    ) -> None:
+        if self.lmcache_engine is None or not block_hashes:
+            return
+        token_database = getattr(self.lmcache_engine, "token_database", None)
+        if token_database is None:
+            return
+        try:
+            entries = token_database.process_tokens(
+                tokens=token_ids,
+                mask=store_mask,
+                make_key=False,
+                request_configs=request_configs,
+            )
+        except Exception as exc:
+            logger.debug("Failed to build hash translation table: %s", exc)
+            return
+
+        with self._hash_translation_lock:
+            for start, end, lm_hash in entries:
+                block_idx = start // self._lmcache_chunk_size
+                if block_idx >= len(block_hashes):
+                    continue
+                self._hash_translation[lm_hash] = block_hashes[block_idx]
+                self._hash_translation_sizes[lm_hash] = end - start
+
+    def _translate_kv_hashes(self, hashes: list[Any]) -> list[Any]:
+        if not hashes:
+            return []
+        with self._hash_translation_lock:
+            return [self._hash_translation.get(h, h) for h in hashes]
+
+    def _evict_hash_translation(self, hashes: list[Any]) -> None:
+        if not hashes:
+            return
+        with self._hash_translation_lock:
+            for h in hashes:
+                self._hash_translation.pop(h, None)
+                self._hash_translation_sizes.pop(h, None)
+
+    @_lmcache_nvtx_annotate
+    def get_kv_events(self) -> list[CacheStoreEvent | CacheEvictEvent]:
+        if self.lmcache_engine is None:
+            return []
+        events = self.lmcache_engine.get_kv_events()
+        if not events:
+            return []
+        translated: list[CacheStoreEvent | CacheEvictEvent] = []
+        for event in events:
+            if hasattr(event, "parent_block_hash"):
+                parent_hash = event.parent_block_hash
+                if parent_hash is not None:
+                    parent_hash = self._translate_kv_hashes([parent_hash])[0]
+                translated.append(
+                    CacheStoreEvent(
+                        block_hashes=self._translate_kv_hashes(event.block_hashes),
+                        parent_block_hash=parent_hash,
+                        token_ids=event.token_ids,
+                        block_size=event.block_size,
+                        lora_id=getattr(event, "lora_id", None),
+                        medium=event.medium,
+                        lora_name=getattr(event, "lora_name", None),
+                    )
+                )
+            else:
+                translated.append(
+                    CacheEvictEvent(
+                        block_hashes=self._translate_kv_hashes(event.block_hashes),
+                        block_size=event.block_size,
+                        medium=event.medium,
+                    )
+                )
+                self._evict_hash_translation(event.block_hashes)
+        return translated
 
     ###################
     # Scheduler side APIs
@@ -1207,9 +1321,11 @@ class LMCacheConnectorV1Impl:
         if not hasattr(self, "_lmcache_tier_stats_by_req"):
             self._lmcache_tier_stats_by_req = {}
         tier_stats = None
+        tier_min: dict[str, int] = {}
         if hasattr(self.lookup_client, "get_tier_stats"):
             tier_stats = self.lookup_client.get_tier_stats(lookup_id)
-        self._lmcache_tier_stats_by_req[request.request_id] = tier_stats or {}
+            tier_min = _split_tier_stats(tier_stats)
+        self._lmcache_tier_stats_by_req[request.request_id] = dict(tier_min)
 
         if num_external_hit_tokens is None:
             logger.info(
@@ -1242,7 +1358,7 @@ class LMCacheConnectorV1Impl:
             can_load=False,
             lookup_prompt_len=lookup_prompt_len,
             recalc_last_token=recalc_last_token,
-            lmcache_tier_hit_tokens=(tier_stats or None),
+            lmcache_tier_hit_tokens=tier_min or None,
         )
         if need_to_allocate <= 0:
             return 0
@@ -1508,5 +1624,3 @@ class LMCacheConnectorV1Impl:
             gpu_connector.set_timing_sink(sink)
         else:
             setattr(gpu_connector, "_timing_sink", sink)
-
-

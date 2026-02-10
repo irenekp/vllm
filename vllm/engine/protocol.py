@@ -138,6 +138,11 @@ class EngineClient(ABC):
         ...
 
     @abstractmethod
+    async def get_kv_duplication_stats(self) -> dict[str, Any]:
+        """Get KV cache duplication stats for the engine."""
+        ...
+
+    @abstractmethod
     async def sleep(self, level: int = 1) -> None:
         """Sleep the engine"""
         ...

@@ -28,6 +28,8 @@ else:
     SamplingParams = object
     Request = object
 
+from vllm.v1.core.kv_cache_utils import ExternalBlockHash, maybe_convert_block_hash
+
 
 @bc_linter_include
 @dataclass
@@ -40,6 +42,7 @@ class NewRequestData:
     block_ids: tuple[list[int], ...]
     num_computed_tokens: int
     lora_request: LoRARequest | None
+    block_hashes: list[ExternalBlockHash] | None = None
     prompt_embeds: "torch.Tensor | None" = None
 
     # Only used for v2 model runner.
@@ -52,6 +55,12 @@ class NewRequestData:
         block_ids: tuple[list[int], ...],
         prefill_token_ids: list[int] | None = None,
     ) -> "NewRequestData":
+        block_hashes = None
+        if request.block_hashes:
+            block_hashes = [
+                maybe_convert_block_hash(block_hash)
+                for block_hash in request.block_hashes
+            ]
         return cls(
             req_id=request.request_id,
             prompt_token_ids=request.prompt_token_ids,
@@ -61,6 +70,7 @@ class NewRequestData:
             block_ids=block_ids,
             num_computed_tokens=request.num_computed_tokens,
             lora_request=request.lora_request,
+            block_hashes=block_hashes,
             prompt_embeds=request.prompt_embeds,
             prefill_token_ids=prefill_token_ids,
         )
@@ -68,6 +78,9 @@ class NewRequestData:
     def __repr__(self) -> str:
         prompt_embeds_shape = (
             self.prompt_embeds.shape if self.prompt_embeds is not None else None
+        )
+        block_hashes_len = (
+            len(self.block_hashes) if self.block_hashes is not None else None
         )
         return (
             f"NewRequestData("
@@ -77,6 +90,7 @@ class NewRequestData:
             f"mm_features={self.mm_features},"
             f"sampling_params={self.sampling_params},"
             f"block_ids={self.block_ids},"
+            f"block_hashes_len={block_hashes_len},"
             f"num_computed_tokens={self.num_computed_tokens},"
             f"lora_request={self.lora_request},"
             f"prompt_embeds_shape={prompt_embeds_shape}"
@@ -94,6 +108,9 @@ class NewRequestData:
         prefill_token_ids_len = (
             len(self.prefill_token_ids) if self.prefill_token_ids is not None else None
         )
+        block_hashes_len = (
+            len(self.block_hashes) if self.block_hashes is not None else None
+        )
         return (
             f"NewRequestData("
             f"req_id={self.req_id},"
@@ -102,6 +119,7 @@ class NewRequestData:
             f"mm_features={self.mm_features},"
             f"sampling_params={self.sampling_params},"
             f"block_ids={self.block_ids},"
+            f"block_hashes_len={block_hashes_len},"
             f"num_computed_tokens={self.num_computed_tokens},"
             f"lora_request={self.lora_request},"
             f"prompt_embeds_shape={prompt_embeds_shape}"

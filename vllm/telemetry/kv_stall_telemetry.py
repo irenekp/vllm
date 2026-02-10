@@ -4,6 +4,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Deque, List, Optional, Tuple
 
+import threading
 import torch
 
 
@@ -110,6 +111,7 @@ class TimingRingBuffer:
     """Fixed-size ring buffer for raw per-step timing event bundles."""
     def __init__(self, capacity: int = 256) -> None:
         self._buf: Deque[BatchTimingEvents] = deque(maxlen=capacity)
+        self._lock = threading.Lock()
 
     def push_events(self, ev: BatchTimingEvents) -> None:
         self._buf.append(ev)
@@ -135,11 +137,11 @@ class TimingRingBuffer:
         return None
     
     def latest(self):
-    """Return most recent record, or None."""
-    with self._lock:
-        if not self._buf:
-            return None
-        return self._buf[-1]
+        """Return most recent record, or None."""
+        with self._lock:
+            if not self._buf:
+                return None
+            return self._buf[-1]
 
     def latest_prefill(self):
         """Return most recent prefill record, or None."""
@@ -265,6 +267,7 @@ def finalize_step_timing(
 
     stall_by_layer, stall_unattributed, unattributed_cnt, out_of_range_cnt, reported_mask = \
         _sum_intervals_ms_by_layer(events.stall_intervals, num_layers=num_layers)
+    has_layer_tags = any(it.layer_id is not None for it in events.stall_intervals)
 
     # TP reduction (MAX) for "true stall" semantics
     tp_reduced = False
@@ -279,6 +282,9 @@ def finalize_step_timing(
     # Missing layers: any layer with no reported interval tag at all
     missing_layers = [i for i, seen in enumerate(reported_mask) if not seen]
     reported_layers = num_layers - len(missing_layers)
+    if not has_layer_tags:
+        missing_layers = []
+        reported_layers = 0
 
     stall_ms = float(sum(stall_by_layer) + stall_unattributed)
     compute_ms = float(forward_ms - stall_ms)
@@ -293,16 +299,25 @@ def finalize_step_timing(
     if events.tp_rank < 0:
         valid = False
         reasons.append("tp_rank_unset")
-    if tp_reduce_max and not tp_reduced:
+    tp_reduce_required = False
+    if tp_reduce_max:
+        import torch.distributed as dist
+        if dist.is_available() and dist.is_initialized():
+            try:
+                tp_reduce_required = dist.get_world_size(group=tp_group) > 1
+            except Exception:
+                tp_reduce_required = True
+
+    if tp_reduce_required and not tp_reduced:
         valid = False
         reasons.append("tp_reduce_not_applied")
-    if len(missing_layers) > 0:
+    if has_layer_tags and len(missing_layers) > 0:
         valid = False
         reasons.append(f"missing_layer_tags:{len(missing_layers)}")
-    if unattributed_cnt > 0:
+    if has_layer_tags and unattributed_cnt > 0:
         valid = False
         reasons.append(f"unattributed_intervals:{unattributed_cnt}")
-    if out_of_range_cnt > 0:
+    if has_layer_tags and out_of_range_cnt > 0:
         valid = False
         reasons.append(f"out_of_range_intervals:{out_of_range_cnt}")
 

@@ -192,40 +192,10 @@ async def get_batch_timing_average(request: Request, last_n: int = 50):
 
 
 @router.get("/cache/duplication")
-async def get_cache_duplication_stats(
-    request: Request,
-    per_worker: bool = True,
-    include_lmcache_internal: bool = True,
-):
-    """
-    Expensive, on-demand endpoint.
-    """
-    client = engine_client(request)
-    call_utility_async = getattr(client, "call_utility_async", None)
-    if callable(call_utility_async):
-        stats = await call_utility_async(
-            "get_cache_duplication_stats",
-            bool(per_worker),
-            bool(include_lmcache_internal),
-        )
-        return JSONResponse(content=stats)
+async def get_cache_duplication_stats(request: Request):
+    stats = await engine_client(request).get_kv_duplication_stats()
+    return JSONResponse(content=stats)
 
-    call_utility = getattr(client, "call_utility", None)
-    if callable(call_utility):
-        stats = call_utility(
-            "get_cache_duplication_stats",
-            bool(per_worker),
-            bool(include_lmcache_internal),
-        )
-        return JSONResponse(content=stats)
-
-    return JSONResponse(
-        status_code=501,
-        content={
-            "error": "Engine client does not support utility calls in this configuration.",
-            "hint": "This endpoint requires a vLLM v1 EngineCore client that supports call_utility_async/call_utility.",
-        },
-    )
 
 @router.post("/flush_batch_timing")
 async def flush_batch_timing(request: Request):

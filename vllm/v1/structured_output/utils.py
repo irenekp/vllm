@@ -17,8 +17,6 @@ from diskcache import Cache
 import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.utils.import_utils import LazyLoader
-from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-
 if TYPE_CHECKING:
     import outlines_core as oc
     import transformers.convert_slow_tokenizer as convert_slow_tokenizer
@@ -26,6 +24,7 @@ if TYPE_CHECKING:
     import xgrammar as xgr
 
     from vllm.tokenizers import TokenizerLike
+    from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
     from vllm.v1.worker.gpu_input_batch import InputBatch
 else:
     xgr = LazyLoader("xgr", globals(), "xgrammar")
@@ -42,9 +41,9 @@ CACHE = None
 
 
 def apply_grammar_bitmask(
-    scheduler_output: SchedulerOutput,
-    grammar_output: GrammarOutput,
-    input_batch: InputBatch,
+    scheduler_output: "SchedulerOutput",
+    grammar_output: "GrammarOutput",
+    input_batch: "InputBatch",
     logits: torch.Tensor,
 ) -> None:
     """

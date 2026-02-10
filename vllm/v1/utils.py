@@ -27,13 +27,12 @@ from vllm.logger import init_logger
 from vllm.usage.usage_lib import UsageContext, is_usage_stats_enabled, usage_message
 from vllm.utils.network_utils import get_open_port, get_open_zmq_ipc_path, get_tcp_uri
 from vllm.utils.system_utils import kill_process_tree
-from vllm.v1.core.sched.output import SchedulerOutput
-
 if TYPE_CHECKING:
     import numpy as np
 
     from vllm.v1.engine.coordinator import DPCoordinator
     from vllm.v1.engine.utils import CoreEngineActorManager, CoreEngineProcManager
+    from vllm.v1.core.sched.output import SchedulerOutput
 
 logger = init_logger(__name__)
 
@@ -429,7 +428,7 @@ class IterationDetails:
                  num_generation_tokens={self.num_generation_tokens})"
 
 
-def compute_iteration_details(scheduler_output: SchedulerOutput) -> IterationDetails:
+def compute_iteration_details(scheduler_output: "SchedulerOutput") -> IterationDetails:
     """
     Compute the number of context/generation requests and tokens
     for the current iteration's scheduler output. A requests is regarded

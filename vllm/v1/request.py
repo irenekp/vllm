@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from __future__ import annotations
 
 import enum
 import time
@@ -14,18 +15,18 @@ from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.utils import length_from_prompt_token_ids_or_embeds
-from vllm.v1.engine import (
-    EngineCoreEvent,
-    EngineCoreEventType,
-    EngineCoreRequest,
-    FinishReason,
-)
 from vllm.v1.structured_output.request import StructuredOutputRequest
 from vllm.v1.utils import ConstantList
 
 if TYPE_CHECKING:
     from vllm.lora.request import LoRARequest
     from vllm.v1.core.kv_cache_utils import BlockHash
+    from vllm.v1.engine import (
+        EngineCoreEvent,
+        EngineCoreEventType,
+        EngineCoreRequest,
+        FinishReason,
+    )
 
 
 @dataclass
@@ -91,7 +92,7 @@ class Request:
         self.arrival_time = arrival_time if arrival_time is not None else time.time()
 
         self.status = RequestStatus.WAITING
-        self.events: list[EngineCoreEvent] = []
+        self.events: list["EngineCoreEvent"] = []
         self.stop_reason: int | str | None = None
 
         # P/D: Connector-specific KV transfer parameters.
@@ -179,7 +180,7 @@ class Request:
     @classmethod
     def from_engine_core_request(
         cls,
-        request: EngineCoreRequest,
+        request: "EngineCoreRequest",
         block_hasher: Callable[["Request"], list["BlockHash"]] | None,
     ) -> "Request":
         return cls(
@@ -268,12 +269,13 @@ class Request:
 
     def record_event(
         self,
-        event_type: EngineCoreEventType,
+        event_type: "EngineCoreEventType",
         timestamp: float | None = None,
     ) -> None:
+        from vllm.v1.engine import EngineCoreEvent
         self.events.append(EngineCoreEvent.new_event(event_type, timestamp))
 
-    def take_events(self) -> list[EngineCoreEvent] | None:
+    def take_events(self) -> list["EngineCoreEvent"] | None:
         if not self.events:
             return None
         events, self.events = self.events, []
@@ -318,19 +320,22 @@ class RequestStatus(enum.IntEnum):
         return status > RequestStatus.PREEMPTED
 
     @staticmethod
-    def get_finished_reason(status: "RequestStatus") -> FinishReason | None:
-        return _FINISHED_REASON_MAP.get(status)
+    def get_finished_reason(status: "RequestStatus") -> "FinishReason | None":
+        return _get_finished_reason_map().get(status)
 
 
 # Mapping of finished statuses to their finish reasons.
 # NOTE: The ignored requests are the requests whose prompt lengths
 # are longer than the model's length cap. Therefore, the stop
 # reason should also be "length" as in OpenAI API.
-_FINISHED_REASON_MAP = {
-    RequestStatus.FINISHED_STOPPED: FinishReason.STOP,
-    RequestStatus.FINISHED_LENGTH_CAPPED: FinishReason.LENGTH,
-    RequestStatus.FINISHED_ABORTED: FinishReason.ABORT,
-    RequestStatus.FINISHED_IGNORED: FinishReason.LENGTH,
-    RequestStatus.FINISHED_ERROR: FinishReason.ERROR,
-    RequestStatus.WAITING_FOR_STREAMING_REQ: FinishReason.STOP,
-}
+def _get_finished_reason_map() -> dict["RequestStatus", "FinishReason"]:
+    from vllm.v1.engine import FinishReason
+
+    return {
+        RequestStatus.FINISHED_STOPPED: FinishReason.STOP,
+        RequestStatus.FINISHED_LENGTH_CAPPED: FinishReason.LENGTH,
+        RequestStatus.FINISHED_ABORTED: FinishReason.ABORT,
+        RequestStatus.FINISHED_IGNORED: FinishReason.LENGTH,
+        RequestStatus.FINISHED_ERROR: FinishReason.ERROR,
+        RequestStatus.WAITING_FOR_STREAMING_REQ: FinishReason.STOP,
+    }

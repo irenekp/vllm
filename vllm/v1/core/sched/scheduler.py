@@ -17,7 +17,11 @@ from vllm.distributed.ec_transfer.ec_connector.base import (
     ECConnectorRole,
 )
 from vllm.distributed.ec_transfer.ec_connector.factory import ECConnectorFactory
-from vllm.distributed.kv_events import EventPublisherFactory, KVEventBatch
+from vllm.distributed.kv_events import (
+    AllBlocksCleared,
+    EventPublisherFactory,
+    KVEventBatch,
+)
 from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
 from vllm.distributed.kv_transfer.kv_connector.v1 import (
     KVConnectorBase_V1,
@@ -53,6 +57,7 @@ from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
+from vllm.telemetry.kv_duplication_tracker import KVDuplicationTracker
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
@@ -106,6 +111,7 @@ class Scheduler(SchedulerInterface):
             self.kv_events_config is not None
             and self.kv_events_config.enable_kv_cache_events
         )
+        self.kv_duplication_tracker = KVDuplicationTracker()
 
         # Create KVConnector for the Scheduler. Note that each Worker
         # will have a corresponding KVConnector with Role=WORKER.
@@ -1440,19 +1446,17 @@ class Scheduler(SchedulerInterface):
             self._update_from_kv_xfer_finished(kv_connector_output)
 
         # collect KV cache events from KV cache manager
-        events = self.kv_cache_manager.take_events()
+        events = self.kv_cache_manager.take_events() if self.enable_kv_cache_events else []
 
         # collect KV cache events from connector
-        if self.connector is not None:
+        if self.enable_kv_cache_events and self.connector is not None:
             connector_events = self.connector.take_events()
             if connector_events:
-                if events is None:
-                    events = list(connector_events)
-                else:
-                    events.extend(connector_events)
+                events.extend(connector_events)
 
         # publish collected KV cache events
         if events:
+            self.kv_duplication_tracker.update(events)
             batch = KVEventBatch(ts=time.time(), events=events)
             self.kv_event_publisher.publish(batch)
 
@@ -1776,6 +1780,8 @@ class Scheduler(SchedulerInterface):
             self.prev_step_scheduled_req_ids.clear()
 
         reset_successful = self.kv_cache_manager.reset_prefix_cache()
+        if reset_successful and self.enable_kv_cache_events:
+            self.kv_duplication_tracker.update([AllBlocksCleared()])
         if reset_running_requests and not reset_successful:
             raise RuntimeError(
                 "Failed to reset KV cache even when all the running requests are "
@@ -1802,6 +1808,14 @@ class Scheduler(SchedulerInterface):
             self.connector_prefix_cache_stats.reset = True
 
         return True
+
+    def get_kv_duplication_stats(self) -> dict[str, Any]:
+        if not self.enable_kv_cache_events:
+            return {"available": False, "counts": None}
+        return {
+            "available": True,
+            "counts": self.kv_duplication_tracker.counts().to_dict(),
+        }
 
     def reset_encoder_cache(self) -> None:
         """Reset the encoder cache to invalidate all cached encoder outputs.

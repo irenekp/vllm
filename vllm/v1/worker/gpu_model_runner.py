@@ -724,13 +724,6 @@ class GPUModelRunner(
             )
         )
         self._telemetry_fallback_batch_id = 0
-        self.kv_connector_output: KVConnectorOutput | None = None
-        # --- KV stall telemetry (V1 runner) ---
-        self._kv_stall_sink = VLLMTimingSink()
-        self._kv_stall_ring = TimingRingBuffer(capacity=256)
-
-    def get_kv_stall_ring(self) -> TimingRingBuffer:
-        return self._kv_stall_ring
 
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
@@ -3553,88 +3546,115 @@ class GPUModelRunner(
         has_encoder_input = (
             self.model_config.is_encoder_decoder and num_encoder_reqs > 0
         )
-        # Prefill-only telemetry: record ONLY when this engine step schedules new requests.
-        # (Decode steps should not produce any telemetry records.)
+        # Prefill-only telemetry: record ONLY when this engine step schedules prefill work.
+        # (Decode-only steps should not produce any telemetry records.)
         _is_prefill_step = bool(getattr(scheduler_output, "scheduled_new_reqs", []))
+        if not _is_prefill_step:
+            for n in scheduler_output.num_scheduled_tokens.values():
+                if n > 1:
+                    _is_prefill_step = True
+                    break
+        timing_step = None
+        timing_stream = None
+        if _is_prefill_step:
+            timing_step = self._kv_stall_sink.start_step()
+            timing_step.batch_id = int(scheduler_output.scheduler_step)
 
-# ---------------- KV stall telemetry (V1, prefill-only) ----------------
-timing_step = None
-timing_stream = None
+            # TP rank: authoritative
+            try:
+                timing_step.tp_rank = int(get_tp_group().rank_in_group)
+            except Exception:
+                timing_step.tp_rank = -1
 
-if _is_prefill_step:
-    timing_step = self._kv_stall_sink.start_step()
-    timing_step.batch_id = int(scheduler_output.scheduler_step)
+            timing_step.is_prefill = True
+            timing_step.num_tokens = int(scheduler_output.total_num_scheduled_tokens)
 
-    # TP rank: authoritative
-    try:
-        timing_step.tp_rank = int(get_tp_group().rank_in_group)
-    except Exception:
-        timing_step.tp_rank = -1
-
-    timing_step.is_prefill = True
-    timing_step.num_tokens = int(scheduler_output.total_num_scheduled_tokens)
-
-    cfg = getattr(self.model, "config", None)
-    timing_step.num_layers = int(getattr(cfg, "num_hidden_layers", getattr(cfg, "num_layers", -1)))
-
-    # Inject sink into kv-transfer group (only for prefill steps)
-    if has_kv_transfer_group():
-        try:
-            get_kv_transfer_group().set_timing_sink(self._kv_stall_sink)
-        except Exception as e:
-            logger.warning("KV transfer group does not accept timing sink: %s", e)
-
-    timing_stream = torch.cuda.current_stream()
-    # ----------------------------------------------------------------------
-
-    # Run the model (telemetry only wraps when prefill step).
-    try:
-        if timing_step is not None:
-            timing_step.forward_start = torch.cuda.Event(enable_timing=True)
-            timing_step.forward_start.record(timing_stream)
-
-        with (
-            set_forward_context(
-                attn_metadata,
-                self.vllm_config,
-                num_tokens=num_tokens_padded,
-                num_tokens_across_dp=num_tokens_across_dp,
-                cudagraph_runtime_mode=cudagraph_mode,
-                batch_descriptor=batch_desc,
-                ubatch_slices=ubatch_slices_padded,
-                slot_mapping=slot_mappings,
-                skip_compiled=has_encoder_input,
-            ),
-            record_function_or_nullcontext("gpu_model_runner: forward"),
-            self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
-        ):
-            if timing_step is not None:
-                timing_step.load_end = torch.cuda.Event(enable_timing=True)
-                timing_step.load_end.record(timing_stream)
-
-            model_output = self._model_forward(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-                **model_kwargs,
+            cfg = getattr(self.model, "config", None)
+            timing_step.num_layers = int(
+                getattr(cfg, "num_hidden_layers", getattr(cfg, "num_layers", -1))
             )
 
-        if timing_step is not None:
-            timing_step.forward_end = torch.cuda.Event(enable_timing=True)
-            timing_step.forward_end.record(timing_stream)
+            # Inject sink into kv-transfer group (only for prefill steps)
+            if has_kv_transfer_group():
+                try:
+                    kv_group = get_kv_transfer_group()
+                    if hasattr(kv_group, "set_timing_sink"):
+                        kv_group.set_timing_sink(self._kv_stall_sink)
+                    else:
+                        lm_impl = getattr(kv_group, "_lmcache_engine", None)
+                        if lm_impl is not None and hasattr(lm_impl, "set_timing_sink"):
+                            lm_impl.set_timing_sink(self._kv_stall_sink)
+                        else:
+                            logger.warning(
+                                "KV transfer group does not expose timing sink hook."
+                            )
+                except Exception as e:
+                    logger.warning(
+                        "KV transfer group does not accept timing sink: %s", e
+                    )
+            else:
+                kv_connector = getattr(self, "kv_connector", None)
+                if kv_connector is not None:
+                    try:
+                        if hasattr(kv_connector, "set_timing_sink"):
+                            kv_connector.set_timing_sink(self._kv_stall_sink)
+                        else:
+                            setattr(kv_connector, "_timing_sink", self._kv_stall_sink)
+                    except Exception as e:
+                        logger.warning(
+                            "KV connector does not accept timing sink: %s", e
+                        )
 
-    finally:
-        if timing_step is not None:
-            try:
-                if timing_step.forward_start is not None and timing_step.forward_end is not None:
-                    self._kv_stall_ring.push_events(timing_step)
-            finally:
-                self._kv_stall_sink.clear_current()
-    # ----------------------------------------------------------------------
+            timing_stream = torch.cuda.current_stream()
 
+        try:
+            if timing_step is not None:
+                timing_step.forward_start = torch.cuda.Event(enable_timing=True)
+                timing_step.forward_start.record(timing_stream)
 
+            with (
+                set_forward_context(
+                    attn_metadata,
+                    self.vllm_config,
+                    num_tokens=num_tokens_padded,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    cudagraph_runtime_mode=cudagraph_mode,
+                    batch_descriptor=batch_desc,
+                    ubatch_slices=ubatch_slices_padded,
+                    slot_mapping=slot_mappings,
+                    skip_compiled=has_encoder_input,
+                ),
+                record_function_or_nullcontext("gpu_model_runner: forward"),
+                self.maybe_get_kv_connector_output(
+                    scheduler_output
+                ) as kv_connector_output,
+            ):
+                if timing_step is not None:
+                    timing_step.load_end = torch.cuda.Event(enable_timing=True)
+                    timing_step.load_end.record(timing_stream)
 
+                model_output = self._model_forward(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs,
+                )
+
+            if timing_step is not None:
+                timing_step.forward_end = torch.cuda.Event(enable_timing=True)
+                timing_step.forward_end.record(timing_stream)
+
+        finally:
+            if timing_step is not None:
+                try:
+                    if (
+                        timing_step.forward_start is not None
+                        and timing_step.forward_end is not None
+                    ):
+                        self._kv_stall_ring.push_events(timing_step)
+                finally:
+                    self._kv_stall_sink.clear_current()
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
