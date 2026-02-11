@@ -10,7 +10,8 @@ from collections.abc import Iterable
 from typing import Any, Optional, Union
 
 from vllm.config import VllmConfig
-from vllm.distributed.kv_events import EventPublisherFactory, KVEventBatch
+from vllm.distributed.kv_events import (AllBlocksCleared,
+                                        EventPublisherFactory, KVEventBatch)
 from vllm.distributed.kv_transfer.kv_connector.factory import (
     KVConnectorFactory)
 from vllm.distributed.kv_transfer.kv_connector.v1 import (KVConnectorBase_V1,
@@ -34,6 +35,7 @@ from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
+from vllm.telemetry.kv_duplication_tracker import KVDuplicationTracker
 
 logger = init_logger(__name__)
 
@@ -75,6 +77,7 @@ class Scheduler(SchedulerInterface):
         self.enable_kv_cache_events = (
             self.kv_events_config is not None
             and self.kv_events_config.enable_kv_cache_events)
+        self.kv_duplication_tracker = KVDuplicationTracker()
 
         # Create KVConnector for the Scheduler. Note that each Worker
         # will have a corresponding KVConnector with Role=WORKER.
@@ -621,6 +624,8 @@ class Scheduler(SchedulerInterface):
 
         # publish collected KV cache events
         if events:
+            if self.enable_kv_cache_events:
+                self.kv_duplication_tracker.update(events)
             batch = KVEventBatch(ts=time.time(), events=events)
             self.kv_event_publisher.publish(batch)
 
@@ -1168,7 +1173,18 @@ class Scheduler(SchedulerInterface):
         return len(self.finished_req_ids) > 0
 
     def reset_prefix_cache(self) -> bool:
-        return self.kv_cache_manager.reset_prefix_cache()
+        reset_successful = self.kv_cache_manager.reset_prefix_cache()
+        if reset_successful and self.enable_kv_cache_events:
+            self.kv_duplication_tracker.update([AllBlocksCleared()])
+        return reset_successful
+
+    def get_kv_duplication_stats(self) -> dict[str, Any]:
+        if not self.enable_kv_cache_events:
+            return {"available": False, "counts": None}
+        return {
+            "available": True,
+            "counts": self.kv_duplication_tracker.counts().to_dict(),
+        }
 
     def make_stats(
         self,

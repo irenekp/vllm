@@ -118,5 +118,8 @@ class KVConnectorModelRunnerMixin:
 
             output.finished_sending, output.finished_recving = (
                 kv_connector.get_finished(scheduler_output.finished_req_ids))
+            output.kv_cache_events = (
+                kv_connector.get_kv_connector_kv_cache_events()
+            )
 
             kv_connector.clear_connector_metadata()

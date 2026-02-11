@@ -381,6 +381,9 @@ class EngineCore:
     def reset_prefix_cache(self):
         self.scheduler.reset_prefix_cache()
 
+    def get_kv_duplication_stats(self) -> dict[str, Any]:
+        return self.scheduler.get_kv_duplication_stats()
+
     def sleep(self, level: int = 1):
         self.model_executor.sleep(level)
 

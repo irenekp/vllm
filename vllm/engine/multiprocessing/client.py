@@ -591,6 +591,13 @@ class MQLLMEngineClient(EngineClient):
             request=RPCResetPrefixCacheRequest(device),
             socket=self.input_socket)
 
+    async def get_kv_duplication_stats(self) -> dict[str, Any]:
+        """Get KV cache duplication stats for the engine."""
+        return {
+            "available": False,
+            "reason": "KV duplication telemetry is only supported in V1.",
+        }
+
     async def sleep(self, level: int = 1) -> None:
         """Sleep the engine for a given level"""
         return await self._send_one_way_rpc_request(

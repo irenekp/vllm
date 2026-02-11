@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, Optional, Union
 
 import torch
 import torch.distributed
+import torch.distributed as dist
 import torch.nn as nn
 
 import vllm.envs as envs
@@ -33,6 +34,7 @@ from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput,
 from vllm.v1.utils import report_usage_stats
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.worker_base import WorkerBase
+from vllm.telemetry.kv_stall_telemetry import finalize_step_timing
 
 logger = init_logger(__name__)
 
@@ -670,6 +672,143 @@ class Worker(WorkerBase):
     ) -> None:
         self.model_runner.save_tensorized_model(
             tensorizer_config=tensorizer_config, )
+
+    def get_lmcache_batch_timing(
+        self,
+        mode: str = "avg",
+        window_size: int = 10,
+        block: bool = True,
+        last_n: int | None = None,
+    ):
+        if last_n is not None:
+            window_size = int(last_n)
+        model_runner = getattr(self, "model_runner", None)
+        if model_runner is None or not hasattr(model_runner, "get_kv_stall_ring"):
+            return None
+
+        ring = model_runner.get_kv_stall_ring()
+        if ring is None:
+            return None
+        tp_group = None
+        pp_rank = -1
+        pp_size = 1
+        if dist.is_available() and dist.is_initialized():
+            try:
+                tp_group = get_tp_group().device_group
+            except Exception:
+                tp_group = dist.group.WORLD
+            try:
+                pp_group = get_pp_group()
+                pp_rank = int(pp_group.rank_in_group)
+                pp_size = int(pp_group.world_size)
+            except Exception:
+                pp_rank = -1
+                pp_size = 1
+
+        def _finalize_one(ev):
+            rec = finalize_step_timing(ev,
+                                       block=block,
+                                       tp_group=tp_group,
+                                       tp_reduce_max=True)
+            if rec is None:
+                return None
+            return {
+                "batch_id": rec.batch_id,
+                "tp_rank": rec.tp_rank,
+                "pp_rank": pp_rank,
+                "pp_size": pp_size,
+                "is_prefill": rec.is_prefill,
+                "num_tokens": rec.num_tokens,
+                "num_layers": rec.num_layers,
+                "valid": rec.valid,
+                "reason": rec.reason,
+                "tp_reduced": rec.tp_reduced,
+                "reported_layers": rec.reported_layers,
+                "missing_layers": rec.missing_layers,
+                "unattributed_layer_intervals": rec.unattributed_layer_intervals,
+                "out_of_range_layer_intervals": rec.out_of_range_layer_intervals,
+                "forward_ms": rec.forward_ms,
+                "stall_ms": rec.stall_ms,
+                "stall_ms_unattributed": rec.stall_ms_unattributed,
+                "stall_ms_by_layer": rec.stall_ms_by_layer,
+                "copy_ms": rec.copy_ms,
+                "compute_ms": rec.compute_ms,
+                "stall_pct": (rec.stall_ms / rec.forward_ms)
+                if rec.forward_ms > 0 else 0.0,
+            }
+
+        if mode in ("last", "debug_last"):
+            last_ev = ring.last_events()
+            if last_ev is None:
+                return None
+            out = _finalize_one(last_ev)
+            if out is None:
+                return None
+
+            if mode == "debug_last":
+                # Provide a compact per-layer summary (top 10 layers by stall)
+                stalls = out.get("stall_ms_by_layer", []) or []
+                indexed = list(enumerate(stalls))
+                indexed.sort(key=lambda x: x[1], reverse=True)
+                out["top_layers_by_stall"] = indexed[:10]
+                out["stall_ms_by_layer_sum_check"] = float(
+                    sum(stalls) +
+                    float(out.get("stall_ms_unattributed", 0.0)))
+            return out
+
+        events = ring.all_events()
+        if not events:
+            return None
+
+        if mode == "avg":
+            events = events[-max(1, int(window_size)):]
+        elif mode == "global_avg":
+            pass
+        else:
+            return None
+
+        records = []
+        for ev in events:
+            r = _finalize_one(ev)
+            if r is not None:
+                records.append(r)
+
+        if not records:
+            return None
+
+        def _mean(key: str) -> float:
+            return float(sum(r[key] for r in records) / len(records))
+
+        return {
+            "pp_rank": pp_rank,
+            "pp_size": pp_size,
+            "window": len(records),
+            "num_samples": len(records),
+            "forward_ms": _mean("forward_ms"),
+            "stall_ms": _mean("stall_ms"),
+            "copy_ms": _mean("copy_ms"),
+            "compute_ms": _mean("compute_ms"),
+            "stall_pct": _mean("stall_pct"),
+            "valid_frac":
+            float(
+                sum(1 for r in records if r.get("valid", False)) /
+                len(records)),
+        }
+
+    def flush_lmcache_batch_timing(self):
+        """
+        Clears the vLLM-owned KV-stall timing ring buffer on this worker.
+        """
+        model_runner = getattr(self, "model_runner", None)
+        if model_runner is None or not hasattr(model_runner, "get_kv_stall_ring"):
+            return {"ok": False, "reason": "no_model_runner_or_ring"}
+
+        ring = model_runner.get_kv_stall_ring()
+        if ring is None:
+            return {"ok": False, "reason": "no_ring"}
+
+        ring.clear()
+        return {"ok": True}
 
     def shutdown(self) -> None:
         self.model_runner.ensure_kv_transfer_shutdown()

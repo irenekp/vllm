@@ -1012,6 +1012,13 @@ class AsyncLLMEngine(EngineClient):
                                  device: Optional[Device] = None) -> None:
         self.engine.reset_prefix_cache(device)
 
+    async def get_kv_duplication_stats(self) -> dict[str, Any]:
+        # V0 engine does not emit KV cache events for duplication tracking.
+        return {
+            "available": False,
+            "reason": "KV duplication telemetry is only supported in V1.",
+        }
+
     async def sleep(self, level: int = 1) -> None:
         await self.reset_prefix_cache()
         self.engine.sleep(level)

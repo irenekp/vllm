@@ -123,6 +123,9 @@ class EngineCoreClient(ABC):
     def reset_prefix_cache(self) -> None:
         raise NotImplementedError
 
+    def get_kv_duplication_stats(self) -> dict[str, Any]:
+        raise NotImplementedError
+
     def sleep(self, level: int = 1) -> None:
         raise NotImplementedError
 
@@ -190,6 +193,9 @@ class EngineCoreClient(ABC):
         raise NotImplementedError
 
     async def reset_prefix_cache_async(self) -> None:
+        raise NotImplementedError
+
+    async def get_kv_duplication_stats_async(self) -> dict[str, Any]:
         raise NotImplementedError
 
     async def sleep_async(self, level: int = 1) -> None:
@@ -270,6 +276,12 @@ class InprocClient(EngineCoreClient):
 
     def reset_prefix_cache(self) -> None:
         self.engine_core.reset_prefix_cache()
+
+    def get_kv_duplication_stats(self) -> dict[str, Any]:
+        return self.engine_core.get_kv_duplication_stats()
+
+    async def get_kv_duplication_stats_async(self) -> dict[str, Any]:
+        return self.engine_core.get_kv_duplication_stats()
 
     def sleep(self, level: int = 1) -> None:
         self.engine_core.sleep(level)
@@ -717,6 +729,9 @@ class SyncMPClient(MPClient):
     def reset_prefix_cache(self) -> None:
         self.call_utility("reset_prefix_cache")
 
+    def get_kv_duplication_stats(self) -> dict[str, Any]:
+        return self.call_utility("get_kv_duplication_stats")
+
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.call_utility("add_lora", lora_request)
 
@@ -916,6 +931,9 @@ class AsyncMPClient(MPClient):
 
     async def reset_prefix_cache_async(self) -> None:
         await self.call_utility_async("reset_prefix_cache")
+
+    async def get_kv_duplication_stats_async(self) -> dict[str, Any]:
+        return await self.call_utility_async("get_kv_duplication_stats")
 
     async def sleep_async(self, level: int = 1) -> None:
         await self.call_utility_async("sleep", level)
