@@ -206,7 +206,43 @@ class cmake_build_ext(build_ext):
             build_tool = []
         # Make sure we use the nvcc from CUDA_HOME
         if _is_cuda():
-            cmake_args += [f'-DCMAKE_CUDA_COMPILER={CUDA_HOME}/bin/nvcc']
+            nvcc_path = f"{CUDA_HOME}/bin/nvcc"
+            cmake_args += [
+                f'-DCMAKE_CUDA_COMPILER={nvcc_path}',
+                f'-DCUDA_NVCC_EXECUTABLE={nvcc_path}',
+            ]
+
+            # Torch's Caffe2 cmake logic still consults legacy FindCUDA vars.
+            # In conda CUDA toolkits, headers/libs usually live under
+            # <CONDA_PREFIX>/targets/x86_64-linux and are not discovered
+            # reliably unless we pass explicit roots.
+            toolkit_root = os.environ.get("CUDAToolkit_ROOT")
+            if not toolkit_root:
+                toolkit_root = os.environ.get("CUDA_TOOLKIT_ROOT_DIR")
+            if not toolkit_root:
+                conda_prefix = os.environ.get("CONDA_PREFIX")
+                if conda_prefix:
+                    conda_toolkit = Path(conda_prefix) / "targets" / "x86_64-linux"
+                    if conda_toolkit.exists():
+                        toolkit_root = str(conda_toolkit)
+
+            if toolkit_root:
+                cmake_args += [
+                    f'-DCUDAToolkit_ROOT={toolkit_root}',
+                    f'-DCUDA_TOOLKIT_ROOT_DIR={toolkit_root}',
+                ]
+
+                include_dir = Path(toolkit_root) / "include"
+                if include_dir.exists():
+                    cmake_args += [f'-DCUDA_INCLUDE_DIRS={include_dir}']
+
+                lib_candidates = [
+                    Path(toolkit_root) / "lib" / "libcudart.so",
+                    Path(toolkit_root) / "lib64" / "libcudart.so",
+                ]
+                cudart = next((p for p in lib_candidates if p.exists()), None)
+                if cudart is not None:
+                    cmake_args += [f'-DCUDA_CUDART_LIBRARY={cudart}']
         subprocess.check_call(
             ['cmake', ext.cmake_lists_dir, *build_tool, *cmake_args],
             cwd=self.build_temp)

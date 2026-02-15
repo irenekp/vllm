@@ -263,12 +263,28 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     set(VLLM_CUTLASS_SRC_DIR $ENV{VLLM_CUTLASS_SRC_DIR})
   endif()
 
+  set(VLLM_USE_MANUAL_CUTLASS OFF)
   if(VLLM_CUTLASS_SRC_DIR)
     if(NOT IS_ABSOLUTE VLLM_CUTLASS_SRC_DIR)
       get_filename_component(VLLM_CUTLASS_SRC_DIR "${VLLM_CUTLASS_SRC_DIR}" ABSOLUTE)
     endif()
     message(STATUS "The VLLM_CUTLASS_SRC_DIR is set, using ${VLLM_CUTLASS_SRC_DIR} for compilation")
-    FetchContent_Declare(cutlass SOURCE_DIR ${VLLM_CUTLASS_SRC_DIR})
+    if(EXISTS "${VLLM_CUTLASS_SRC_DIR}/CMakeLists.txt")
+      FetchContent_Declare(cutlass SOURCE_DIR ${VLLM_CUTLASS_SRC_DIR})
+    else()
+      # Offline fallback: allow a header-only CUTLASS tree without its top-level
+      # CMake project (e.g. packaged via other dependencies).
+      set(VLLM_USE_MANUAL_CUTLASS ON)
+      set(CUTLASS_DIR "${VLLM_CUTLASS_SRC_DIR}")
+      set(CUTLASS_INCLUDE_DIR "${CUTLASS_DIR}/include")
+      set(CUTLASS_TOOLS_UTIL_INCLUDE_DIR "${CUTLASS_DIR}/tools/util/include")
+      if(NOT EXISTS "${CUTLASS_INCLUDE_DIR}/cutlass/cutlass.h")
+        message(FATAL_ERROR
+          "VLLM_CUTLASS_SRC_DIR is set to '${VLLM_CUTLASS_SRC_DIR}', "
+          "but '${CUTLASS_INCLUDE_DIR}/cutlass/cutlass.h' was not found.")
+      endif()
+      message(STATUS "Using header-only CUTLASS from: ${CUTLASS_DIR}")
+    endif()
   else()
     FetchContent_Declare(
         cutlass
@@ -283,7 +299,20 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
         GIT_SHALLOW TRUE
     )
   endif()
-  FetchContent_MakeAvailable(cutlass)
+  if(NOT VLLM_USE_MANUAL_CUTLASS)
+    FetchContent_MakeAvailable(cutlass)
+  endif()
+
+  # Be robust across CUTLASS packaging variants.
+  if(NOT CUTLASS_DIR AND DEFINED cutlass_SOURCE_DIR)
+    set(CUTLASS_DIR "${cutlass_SOURCE_DIR}")
+  endif()
+  if(NOT CUTLASS_INCLUDE_DIR AND CUTLASS_DIR)
+    set(CUTLASS_INCLUDE_DIR "${CUTLASS_DIR}/include")
+  endif()
+  if(NOT CUTLASS_TOOLS_UTIL_INCLUDE_DIR AND CUTLASS_DIR)
+    set(CUTLASS_TOOLS_UTIL_INCLUDE_DIR "${CUTLASS_DIR}/tools/util/include")
+  endif()
 
   list(APPEND VLLM_EXT_SRC
     "csrc/quantization/awq/gemm_kernels.cu"
