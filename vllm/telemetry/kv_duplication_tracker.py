@@ -54,6 +54,22 @@ class KVDuplicationTracker:
     def counts(self) -> DuplicationCounts:
         return self._counts
 
+    def duplicated_tokens(self) -> int:
+        """Return unique duplicated tokens across GPU and any host tier."""
+        total = 0
+        for key, gpu_tokens in self._gpu_resident.items():
+            tiers = self._cpu_resident.get(key)
+            if not tiers:
+                continue
+            for tier_name, tier_tokens in tiers.items():
+                if int(tier_tokens) != int(gpu_tokens):
+                    raise RuntimeError(
+                        f"Token-count mismatch for block {key}: gpu={gpu_tokens}, "
+                        f"{tier_name}={tier_tokens}"
+                    )
+            total += int(gpu_tokens)
+        return int(total)
+
     def update(self, events: Iterable[KVCacheEvent]) -> None:
         for event in events:
             if isinstance(event, BlockStored):

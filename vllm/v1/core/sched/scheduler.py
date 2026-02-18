@@ -1180,11 +1180,17 @@ class Scheduler(SchedulerInterface):
 
     def get_kv_duplication_stats(self) -> dict[str, Any]:
         if not self.enable_kv_cache_events:
-            return {"available": False, "counts": None}
-        return {
-            "available": True,
-            "counts": self.kv_duplication_tracker.counts().to_dict(),
-        }
+            return {
+                "available": False,
+                "error": "kv_cache_events_disabled",
+            }
+        try:
+            duplicated_tokens = self.kv_duplication_tracker.duplicated_tokens()
+        except Exception as e:
+            return {
+                "error": f"integrity_violation: {e}",
+            }
+        return {"duplicated_tokens": int(duplicated_tokens)}
 
     def make_stats(
         self,
