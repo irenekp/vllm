@@ -795,6 +795,79 @@ class Worker(WorkerBase):
                 len(records)),
         }
 
+    def get_lmcache_prefill_batch_stream(
+        self,
+        after_batch_id: int = 0,
+        limit: int = 128,
+        block: bool = True,
+    ):
+        model_runner = getattr(self, "model_runner", None)
+        if model_runner is None or not hasattr(model_runner, "get_kv_stall_ring"):
+            return {
+                "available": False,
+                "error": "cache_batch_timing_telemetry_unavailable",
+            }
+
+        ring = model_runner.get_kv_stall_ring()
+        if ring is None:
+            return {
+                "available": False,
+                "error": "cache_batch_timing_telemetry_unavailable",
+            }
+
+        events, earliest_batch_id, latest_batch_id, cursor_too_old = (
+            ring.get_after_batch_id(
+                after_batch_id=int(after_batch_id),
+                limit=int(limit),
+            )
+        )
+        if cursor_too_old:
+            return {
+                "available": False,
+                "error": "cursor_too_old",
+                "earliest_batch_id": earliest_batch_id,
+                "latest_batch_id": latest_batch_id,
+            }
+
+        records = []
+        for ev in events:
+            rec = finalize_step_timing(
+                ev,
+                block=block,
+                tp_group=None,
+                tp_reduce_max=False,
+            )
+            if rec is None or not rec.is_prefill:
+                continue
+
+            host_hit_tokens_by_tier = {
+                str(k): int(v)
+                for k, v in (rec.host_hit_tokens_by_tier or {}).items()
+                if int(v) > 0
+            }
+            records.append(
+                {
+                    "batch_id": int(rec.batch_id),
+                    "forward_ms": float(rec.forward_ms),
+                    "stall_ms": float(rec.stall_ms),
+                    "copy_ms": float(rec.copy_ms),
+                    "compute_ms": float(rec.compute_ms),
+                    "total_cache_tokens": int(rec.total_cache_tokens),
+                    "new_prefill_tokens": int(rec.new_prefill_tokens),
+                    "gpu_hit_tokens": int(rec.gpu_hit_tokens),
+                    "host_hit_tokens": int(rec.host_hit_tokens),
+                    "host_hit_tokens_by_tier": host_hit_tokens_by_tier,
+                }
+            )
+
+        records.sort(key=lambda x: int(x["batch_id"]))
+        return {
+            "available": True,
+            "records": records,
+            "earliest_batch_id": earliest_batch_id,
+            "latest_batch_id": latest_batch_id,
+        }
+
     def flush_lmcache_batch_timing(self):
         """
         Clears the vLLM-owned KV-stall timing ring buffer on this worker.

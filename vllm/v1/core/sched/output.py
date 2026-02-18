@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional
 
 from vllm import bc_linter_include
@@ -160,3 +160,18 @@ class SchedulerOutput:
 
     # KV Cache Connector metadata.
     kv_connector_metadata: Optional[KVConnectorMetadata] = None
+
+    # Prefill-batch telemetry payload for this scheduler step.
+    # None means this step did not schedule prefill work.
+    prefill_batch_telemetry: Optional["PrefillBatchTelemetry"] = None
+
+
+@bc_linter_include
+@dataclass
+class PrefillBatchTelemetry:
+    batch_id: int
+    new_prefill_tokens: int
+    gpu_hit_tokens: int
+    host_hit_tokens: int
+    total_cache_tokens: int
+    host_hit_tokens_by_tier: dict[str, int] = field(default_factory=dict)

@@ -578,53 +578,150 @@ async def show_version():
 
 
 @router.get("/telemetry/cache/batch_timing")
-async def get_cache_batch_timing(request: Request):
+async def get_cache_batch_timing(
+    request: Request,
+    after_batch_id: int = 0,
+    limit: int = 128,
+):
+    limit = max(1, min(int(limit), 1000))
     results = await engine_client(request).collective_rpc(
-        "get_lmcache_batch_timing",
-        kwargs={"mode": "last"},
+        "get_lmcache_prefill_batch_stream",
+        kwargs={
+            "after_batch_id": int(after_batch_id),
+            "limit": limit,
+        },
     )
-    per_rank = [r for r in results if isinstance(r, dict)]
-    if not per_rank:
+    per_worker = [r for r in results if isinstance(r, dict)]
+    if not per_worker:
         raise HTTPException(
             status_code=HTTPStatus.SERVICE_UNAVAILABLE,
             detail="cache batch timing telemetry unavailable",
         )
 
-    stage_map: dict[int, dict[str, float]] = {}
-    for r in per_rank:
-        pp_rank = int(r.get("pp_rank", 0))
-        stage = stage_map.get(pp_rank)
-        if stage is None:
-            stage = {
-                "forward_ms": float(r.get("forward_ms", 0.0)),
-                "stall_ms": float(r.get("stall_ms", 0.0)),
-                "copy_ms": float(r.get("copy_ms", 0.0)),
-                "compute_ms": float(r.get("compute_ms", 0.0)),
+    cursor_errors = [r for r in per_worker if r.get("error") == "cursor_too_old"]
+    if cursor_errors:
+        earliest_values = [
+            int(r["earliest_batch_id"])
+            for r in cursor_errors
+            if r.get("earliest_batch_id") is not None
+        ]
+        latest_values = [
+            int(r["latest_batch_id"])
+            for r in cursor_errors
+            if r.get("latest_batch_id") is not None
+        ]
+        raise HTTPException(
+            status_code=HTTPStatus.CONFLICT,
+            detail={
+                "error": "cursor_too_old",
+                "earliest_batch_id": (
+                    min(earliest_values) if earliest_values else None
+                ),
+                "latest_batch_id": (max(latest_values) if latest_values else None),
+            },
+        )
+
+    unavailable = [r for r in per_worker if r.get("available") is False]
+    if unavailable:
+        error = str(
+            unavailable[0].get("error") or "cache batch timing telemetry unavailable"
+        )
+        status = (
+            HTTPStatus.INTERNAL_SERVER_ERROR
+            if error.startswith("integrity_violation")
+            else HTTPStatus.SERVICE_UNAVAILABLE
+        )
+        raise HTTPException(status_code=status, detail=error)
+
+    merged: dict[int, dict] = {}
+    for worker in per_worker:
+        for record in worker.get("records", []):
+            batch_id = int(record.get("batch_id", -1))
+            if batch_id < 0:
+                raise HTTPException(
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    detail="integrity_violation: invalid_batch_id",
+                )
+
+            host_hit_tokens_by_tier = {
+                str(k): int(v)
+                for k, v in (record.get("host_hit_tokens_by_tier") or {}).items()
+                if int(v) > 0
             }
-            stage_map[pp_rank] = stage
-        else:
-            stage["forward_ms"] = max(stage["forward_ms"],
-                                      float(r.get("forward_ms", 0.0)))
-            stage["stall_ms"] = max(stage["stall_ms"],
-                                    float(r.get("stall_ms", 0.0)))
-            stage["copy_ms"] = max(stage["copy_ms"],
-                                   float(r.get("copy_ms", 0.0)))
-            stage["compute_ms"] = max(stage["compute_ms"],
-                                      float(r.get("compute_ms", 0.0)))
+            host_hit_tokens = int(record.get("host_hit_tokens", 0))
+            gpu_hit_tokens = int(record.get("gpu_hit_tokens", 0))
+            total_cache_tokens = int(record.get("total_cache_tokens", 0))
+            if host_hit_tokens != sum(host_hit_tokens_by_tier.values()):
+                raise HTTPException(
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    detail="integrity_violation: host_hit_tokens_mismatch",
+                )
+            if total_cache_tokens != gpu_hit_tokens + host_hit_tokens:
+                raise HTTPException(
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    detail="integrity_violation: total_cache_tokens_mismatch",
+                )
 
-    stages = list(stage_map.values())
-    if not stages:
-        raise HTTPException(
-            status_code=HTTPStatus.SERVICE_UNAVAILABLE,
-            detail="cache batch timing telemetry unavailable",
+            non_timing = {
+                "batch_id": batch_id,
+                "total_cache_tokens": total_cache_tokens,
+                "new_prefill_tokens": int(record.get("new_prefill_tokens", 0)),
+                "gpu_hit_tokens": gpu_hit_tokens,
+                "host_hit_tokens": host_hit_tokens,
+                "host_hit_tokens_by_tier": host_hit_tokens_by_tier,
+            }
+            timing_forward = float(record.get("forward_ms", 0.0))
+            timing_stall = float(record.get("stall_ms", 0.0))
+            timing_copy = float(record.get("copy_ms", 0.0))
+
+            current = merged.get(batch_id)
+            if current is None:
+                merged[batch_id] = {
+                    **non_timing,
+                    "forward_ms": timing_forward,
+                    "stall_ms": timing_stall,
+                    "copy_ms": timing_copy,
+                }
+            else:
+                for field in (
+                    "total_cache_tokens",
+                    "new_prefill_tokens",
+                    "gpu_hit_tokens",
+                    "host_hit_tokens",
+                    "host_hit_tokens_by_tier",
+                ):
+                    if current[field] != non_timing[field]:
+                        raise HTTPException(
+                            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                            detail=f"integrity_violation: non_timing_mismatch:{field}",
+                        )
+                current["forward_ms"] = max(current["forward_ms"], timing_forward)
+                current["stall_ms"] = max(current["stall_ms"], timing_stall)
+                current["copy_ms"] = max(current["copy_ms"], timing_copy)
+
+    batches = []
+    for batch_id in sorted(merged):
+        row = merged[batch_id]
+        compute_ms = float(row["forward_ms"] - row["stall_ms"])
+        batches.append(
+            {
+                "batch_id": int(batch_id),
+                "forward_ms": float(row["forward_ms"]),
+                "stall_ms": float(row["stall_ms"]),
+                "copy_ms": float(row["copy_ms"]),
+                "compute_ms": compute_ms,
+                "total_cache_tokens": int(row["total_cache_tokens"]),
+                "new_prefill_tokens": int(row["new_prefill_tokens"]),
+                "gpu_hit_tokens": int(row["gpu_hit_tokens"]),
+                "host_hit_tokens": int(row["host_hit_tokens"]),
+                "host_hit_tokens_by_tier": row["host_hit_tokens_by_tier"],
+            }
         )
-    return JSONResponse(
-        content={
-            "forward_ms": float(max(s["forward_ms"] for s in stages)),
-            "stall_ms": float(max(s["stall_ms"] for s in stages)),
-            "copy_ms": float(max(s["copy_ms"] for s in stages)),
-            "compute_ms": float(max(s["compute_ms"] for s in stages)),
-        })
+
+    if len(batches) > limit:
+        batches = batches[:limit]
+
+    return JSONResponse(content={"batches": batches})
 
 
 @router.get("/telemetry/cache/duplication")

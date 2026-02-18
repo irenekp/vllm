@@ -23,7 +23,7 @@ from vllm.v1.core.encoder_cache_manager import (EncoderCacheManager,
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.sched.interface import SchedulerInterface
 from vllm.v1.core.sched.output import (CachedRequestData, NewRequestData,
-                                       SchedulerOutput)
+                                       PrefillBatchTelemetry, SchedulerOutput)
 from vllm.v1.core.sched.request_queue import (SchedulingPolicy,
                                               create_request_queue)
 from vllm.v1.core.sched.utils import check_stop, remove_all
@@ -176,6 +176,34 @@ class Scheduler(SchedulerInterface):
             dcp_world_size=self.dcp_world_size,
         )
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
+        self.prefill_batch_next_id = 1
+
+    @staticmethod
+    def _extract_host_hits_by_tier(
+        request: Request,
+    ) -> dict[str, int]:
+        kv_params = getattr(request, "kv_transfer_params", None)
+        if not isinstance(kv_params, dict):
+            return {}
+        telemetry = kv_params.get("_lmcache_telemetry")
+        if not isinstance(telemetry, dict):
+            return {}
+
+        raw_tiers = telemetry.get("lmcache_tier_hit_tokens")
+        if not isinstance(raw_tiers, dict):
+            return {}
+
+        host_by_tier = {
+            str(k): int(v)
+            for k, v in raw_tiers.items()
+            if int(v) > 0
+        }
+        if telemetry.get("recalc_last_token", False) and host_by_tier:
+            dominant_tier = max(host_by_tier, key=lambda k: host_by_tier[k])
+            host_by_tier[dominant_tier] = max(0, host_by_tier[dominant_tier] - 1)
+            if host_by_tier[dominant_tier] == 0:
+                host_by_tier.pop(dominant_tier)
+        return host_by_tier
 
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
@@ -202,6 +230,12 @@ class Scheduler(SchedulerInterface):
         encoder_compute_budget = self.max_num_encoder_input_tokens
         # Spec decode-related.
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
+        prefill_batch_has_work = False
+        prefill_new_prefill_tokens = 0
+        prefill_gpu_hit_tokens = 0
+        prefill_host_hit_tokens = 0
+        prefill_total_cache_tokens = 0
+        prefill_host_hit_tokens_by_tier: dict[str, int] = defaultdict(int)
 
         # For logging.
         scheduled_timestamp = time.monotonic()
@@ -300,6 +334,14 @@ class Scheduler(SchedulerInterface):
             token_budget -= num_new_tokens
             req_index += 1
 
+            prefill_tokens_this_step = min(
+                int(num_new_tokens),
+                max(int(request.num_prompt_tokens - request.num_computed_tokens), 0),
+            )
+            if prefill_tokens_this_step > 0:
+                prefill_batch_has_work = True
+                prefill_new_prefill_tokens += prefill_tokens_this_step
+
             # Speculative decode related.
             if request.spec_token_ids:
                 num_scheduled_spec_tokens = (num_new_tokens +
@@ -376,6 +418,7 @@ class Scheduler(SchedulerInterface):
 
                 num_external_computed_tokens = 0
                 load_kv_async = False
+                should_count_cache_hits = request.num_computed_tokens == 0
 
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
@@ -522,6 +565,27 @@ class Scheduler(SchedulerInterface):
                     raise RuntimeError(
                         f"Invalid request status: {request.status}")
 
+                gpu_hit_tokens = 0
+                host_hit_tokens_by_tier: dict[str, int] = {}
+                if should_count_cache_hits:
+                    gpu_hit_tokens = int(num_new_local_computed_tokens)
+                    host_hit_tokens_by_tier = self._extract_host_hits_by_tier(request)
+                host_hit_tokens = int(sum(host_hit_tokens_by_tier.values()))
+                total_cache_tokens = int(gpu_hit_tokens + host_hit_tokens)
+
+                prefill_tokens_this_step = min(
+                    int(num_new_tokens),
+                    max(int(request.num_prompt_tokens - num_computed_tokens), 0),
+                )
+                if prefill_tokens_this_step > 0:
+                    prefill_batch_has_work = True
+                    prefill_new_prefill_tokens += prefill_tokens_this_step
+                prefill_gpu_hit_tokens += gpu_hit_tokens
+                prefill_host_hit_tokens += host_hit_tokens
+                prefill_total_cache_tokens += total_cache_tokens
+                for tier, value in host_hit_tokens_by_tier.items():
+                    prefill_host_hit_tokens_by_tier[tier] += int(value)
+
                 if self.lora_config and request.lora_request:
                     scheduled_loras.add(request.lora_request.lora_int_id)
                 req_to_new_blocks[request.request_id] = (
@@ -583,6 +647,33 @@ class Scheduler(SchedulerInterface):
         structured_output_request_ids, grammar_bitmask = (
             self.get_grammar_bitmask(self.running,
                                      scheduled_spec_decode_tokens))
+        prefill_batch_telemetry = None
+        if prefill_batch_has_work:
+            host_hit_tokens_by_tier = {
+                tier: int(value)
+                for tier, value in prefill_host_hit_tokens_by_tier.items()
+                if int(value) > 0
+            }
+            if prefill_host_hit_tokens != sum(host_hit_tokens_by_tier.values()):
+                raise RuntimeError(
+                    "integrity_violation: host_hit_tokens_by_tier_sum_mismatch"
+                )
+            if prefill_total_cache_tokens != (
+                prefill_gpu_hit_tokens + prefill_host_hit_tokens
+            ):
+                raise RuntimeError(
+                    "integrity_violation: total_cache_tokens_mismatch"
+                )
+            prefill_batch_telemetry = PrefillBatchTelemetry(
+                batch_id=int(self.prefill_batch_next_id),
+                new_prefill_tokens=int(prefill_new_prefill_tokens),
+                gpu_hit_tokens=int(prefill_gpu_hit_tokens),
+                host_hit_tokens=int(prefill_host_hit_tokens),
+                total_cache_tokens=int(prefill_total_cache_tokens),
+                host_hit_tokens_by_tier=host_hit_tokens_by_tier,
+            )
+            self.prefill_batch_next_id += 1
+
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=cached_reqs_data,
@@ -600,6 +691,7 @@ class Scheduler(SchedulerInterface):
             get_freed_mm_hashes(),
             structured_output_request_ids=structured_output_request_ids,
             grammar_bitmask=grammar_bitmask,
+            prefill_batch_telemetry=prefill_batch_telemetry,
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:

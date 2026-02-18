@@ -415,7 +415,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 else 256
             )
         )
-        self._telemetry_batch_id = 0
 
     def _make_buffer(self,
                      *size: Union[int, torch.SymInt],
@@ -435,10 +434,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
     def get_kv_stall_sink(self) -> VLLMTimingSink:
         return self._kv_stall_sink
-
-    def _next_batch_id(self) -> int:
-        self._telemetry_batch_id += 1
-        return int(self._telemetry_batch_id)
 
     def _init_model_kwargs(self, num_tokens: int):
         model_kwargs = dict[str, Any]()
@@ -2080,16 +2075,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         timing_step = None
         timing_stream = None
         if self.device.type == "cuda":
-            _is_prefill_step = bool(
-                getattr(scheduler_output, "scheduled_new_reqs", []))
-            if not _is_prefill_step:
-                for n in scheduler_output.num_scheduled_tokens.values():
-                    if n > 1:
-                        _is_prefill_step = True
-                        break
-            if _is_prefill_step:
+            prefill_batch = getattr(scheduler_output, "prefill_batch_telemetry", None)
+            if prefill_batch is not None:
                 timing_step = self._kv_stall_sink.start_step()
-                timing_step.batch_id = self._next_batch_id()
+                timing_step.batch_id = int(prefill_batch.batch_id)
 
                 # TP rank: authoritative
                 try:
@@ -2100,6 +2089,15 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 timing_step.is_prefill = True
                 timing_step.num_tokens = int(
                     scheduler_output.total_num_scheduled_tokens)
+                timing_step.total_cache_tokens = int(prefill_batch.total_cache_tokens)
+                timing_step.new_prefill_tokens = int(prefill_batch.new_prefill_tokens)
+                timing_step.gpu_hit_tokens = int(prefill_batch.gpu_hit_tokens)
+                timing_step.host_hit_tokens = int(prefill_batch.host_hit_tokens)
+                timing_step.host_hit_tokens_by_tier = {
+                    str(k): int(v)
+                    for k, v in prefill_batch.host_hit_tokens_by_tier.items()
+                    if int(v) > 0
+                }
 
                 cfg = getattr(self.model, "config", None)
                 timing_step.num_layers = int(

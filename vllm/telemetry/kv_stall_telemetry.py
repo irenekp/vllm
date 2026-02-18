@@ -26,6 +26,11 @@ class BatchTimingEvents:
     is_prefill: bool = False
     num_tokens: int = -1
     num_layers: int = -1
+    total_cache_tokens: int = 0
+    new_prefill_tokens: int = 0
+    gpu_hit_tokens: int = 0
+    host_hit_tokens: int = 0
+    host_hit_tokens_by_tier: dict[str, int] = field(default_factory=dict)
 
     # ---- raw timing events ----
     copy_intervals: List[CudaEventInterval] = field(default_factory=list)
@@ -44,6 +49,11 @@ class BatchTimingRecord:
     is_prefill: bool
     num_tokens: int
     num_layers: int
+    total_cache_tokens: int
+    new_prefill_tokens: int
+    gpu_hit_tokens: int
+    host_hit_tokens: int
+    host_hit_tokens_by_tier: dict[str, int]
 
     # ---- validation ----
     valid: bool
@@ -121,18 +131,46 @@ class TimingRingBuffer:
         self._lock = threading.Lock()
 
     def push_events(self, ev: BatchTimingEvents) -> None:
-        self._buf.append(ev)
+        with self._lock:
+            self._buf.append(ev)
 
     def last_events(self) -> Optional[BatchTimingEvents]:
-        if not self._buf:
-            return None
-        return self._buf[-1]
+        with self._lock:
+            if not self._buf:
+                return None
+            return self._buf[-1]
 
     def all_events(self) -> List[BatchTimingEvents]:
-        return list(self._buf)
+        with self._lock:
+            return list(self._buf)
 
     def clear(self) -> None:
-        self._buf.clear()
+        with self._lock:
+            self._buf.clear()
+
+    def get_after_batch_id(
+        self,
+        *,
+        after_batch_id: int,
+        limit: int,
+    ) -> tuple[list[BatchTimingEvents], Optional[int], Optional[int], bool]:
+        with self._lock:
+            if not self._buf:
+                return [], None, None, False
+
+            earliest_batch_id = int(self._buf[0].batch_id)
+            latest_batch_id = int(self._buf[-1].batch_id)
+            if int(after_batch_id) < earliest_batch_id - 1:
+                return [], earliest_batch_id, latest_batch_id, True
+
+            out: list[BatchTimingEvents] = []
+            max_items = max(1, min(int(limit), 1000))
+            for rec in self._buf:
+                if int(rec.batch_id) > int(after_batch_id):
+                    out.append(rec)
+                if len(out) >= max_items:
+                    break
+            return out, earliest_batch_id, latest_batch_id, False
 
     def get_last_where(self, pred):
         with self._lock:
@@ -253,6 +291,16 @@ def finalize_step_timing(
 
     forward_ms = float(events.forward_start.elapsed_time(events.forward_end))
     copy_ms = float(_sum_intervals_ms(events.copy_intervals))
+    host_hit_tokens_by_tier = {
+        str(k): int(v)
+        for k, v in (events.host_hit_tokens_by_tier or {}).items()
+        if int(v) > 0
+    }
+    host_hit_tokens = int(events.host_hit_tokens)
+    gpu_hit_tokens = int(events.gpu_hit_tokens)
+    total_cache_tokens = int(events.total_cache_tokens)
+    new_prefill_tokens = int(events.new_prefill_tokens)
+    host_hit_tokens_sum = int(sum(host_hit_tokens_by_tier.values()))
 
     # Compute per-layer stalls + attribution stats
     num_layers = int(events.num_layers)
@@ -265,6 +313,11 @@ def finalize_step_timing(
             is_prefill=bool(events.is_prefill),
             num_tokens=int(events.num_tokens),
             num_layers=num_layers,
+            total_cache_tokens=total_cache_tokens,
+            new_prefill_tokens=new_prefill_tokens,
+            gpu_hit_tokens=gpu_hit_tokens,
+            host_hit_tokens=host_hit_tokens,
+            host_hit_tokens_by_tier=host_hit_tokens_by_tier,
             valid=False,
             reason="num_layers_not_set",
             tp_reduced=False,
@@ -338,6 +391,15 @@ def finalize_step_timing(
     if has_layer_tags and out_of_range_cnt > 0:
         valid = False
         reasons.append(f"out_of_range_intervals:{out_of_range_cnt}")
+    if host_hit_tokens != host_hit_tokens_sum:
+        valid = False
+        reasons.append("host_hit_tokens_mismatch")
+    if total_cache_tokens != gpu_hit_tokens + host_hit_tokens:
+        valid = False
+        reasons.append("total_cache_tokens_mismatch")
+    if abs(compute_ms - (forward_ms - stall_ms)) > 1e-3:
+        valid = False
+        reasons.append("compute_ms_mismatch")
 
     reason = "ok" if valid else ";".join(reasons)
 
@@ -347,6 +409,11 @@ def finalize_step_timing(
         is_prefill=bool(events.is_prefill),
         num_tokens=int(events.num_tokens),
         num_layers=num_layers,
+        total_cache_tokens=total_cache_tokens,
+        new_prefill_tokens=new_prefill_tokens,
+        gpu_hit_tokens=gpu_hit_tokens,
+        host_hit_tokens=host_hit_tokens,
+        host_hit_tokens_by_tier=host_hit_tokens_by_tier,
         valid=bool(valid),
         reason=str(reason),
         tp_reduced=bool(tp_reduced),
