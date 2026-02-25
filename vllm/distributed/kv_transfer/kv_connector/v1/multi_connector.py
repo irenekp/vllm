@@ -121,6 +121,14 @@ class MultiConnector(KVConnectorBase_V1):
         for c in self._connectors:
             c.wait_for_save()
 
+    def set_timing_sink(self, sink) -> None:
+        """
+        Forward telemetry timing sink to wrapped connectors.
+        """
+        for c in self._connectors:
+            if hasattr(c, "set_timing_sink"):
+                c.set_timing_sink(sink)
+
     def get_finished(
         self, finished_req_ids: set[str]
     ) -> tuple[Optional[set[str]], Optional[set[str]]]:
