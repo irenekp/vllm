@@ -26,11 +26,11 @@ class BatchTimingEvents:
     is_prefill: bool = False
     num_tokens: int = -1
     num_layers: int = -1
-    total_cache_tokens: int = 0
+    total_cached_tokens: int = 0
     new_prefill_tokens: int = 0
-    gpu_hit_tokens: int = 0
-    host_hit_tokens: int = 0
-    host_hit_tokens_by_tier: dict[str, int] = field(default_factory=dict)
+    gpu_resident_tokens: int = 0
+    host_fetched_tokens: int = 0
+    host_fetched_tokens_by_tier: dict[str, int] = field(default_factory=dict)
 
     # ---- raw timing events ----
     copy_intervals: List[CudaEventInterval] = field(default_factory=list)
@@ -49,11 +49,11 @@ class BatchTimingRecord:
     is_prefill: bool
     num_tokens: int
     num_layers: int
-    total_cache_tokens: int
+    total_cached_tokens: int
     new_prefill_tokens: int
-    gpu_hit_tokens: int
-    host_hit_tokens: int
-    host_hit_tokens_by_tier: dict[str, int]
+    gpu_resident_tokens: int
+    host_fetched_tokens: int
+    host_fetched_tokens_by_tier: dict[str, int]
 
     # ---- validation ----
     valid: bool
@@ -291,16 +291,16 @@ def finalize_step_timing(
 
     forward_ms = float(events.forward_start.elapsed_time(events.forward_end))
     copy_ms = float(_sum_intervals_ms(events.copy_intervals))
-    host_hit_tokens_by_tier = {
+    host_fetched_tokens_by_tier = {
         str(k): int(v)
-        for k, v in (events.host_hit_tokens_by_tier or {}).items()
+        for k, v in (events.host_fetched_tokens_by_tier or {}).items()
         if int(v) > 0
     }
-    host_hit_tokens = int(events.host_hit_tokens)
-    gpu_hit_tokens = int(events.gpu_hit_tokens)
-    total_cache_tokens = int(events.total_cache_tokens)
+    host_fetched_tokens = int(events.host_fetched_tokens)
+    gpu_resident_tokens = int(events.gpu_resident_tokens)
+    total_cached_tokens = int(events.total_cached_tokens)
     new_prefill_tokens = int(events.new_prefill_tokens)
-    host_hit_tokens_sum = int(sum(host_hit_tokens_by_tier.values()))
+    host_fetched_tokens_sum = int(sum(host_fetched_tokens_by_tier.values()))
 
     # Compute per-layer stalls + attribution stats
     num_layers = int(events.num_layers)
@@ -313,11 +313,11 @@ def finalize_step_timing(
             is_prefill=bool(events.is_prefill),
             num_tokens=int(events.num_tokens),
             num_layers=num_layers,
-            total_cache_tokens=total_cache_tokens,
+            total_cached_tokens=total_cached_tokens,
             new_prefill_tokens=new_prefill_tokens,
-            gpu_hit_tokens=gpu_hit_tokens,
-            host_hit_tokens=host_hit_tokens,
-            host_hit_tokens_by_tier=host_hit_tokens_by_tier,
+            gpu_resident_tokens=gpu_resident_tokens,
+            host_fetched_tokens=host_fetched_tokens,
+            host_fetched_tokens_by_tier=host_fetched_tokens_by_tier,
             valid=False,
             reason="num_layers_not_set",
             tp_reduced=False,
@@ -391,12 +391,12 @@ def finalize_step_timing(
     if has_layer_tags and out_of_range_cnt > 0:
         valid = False
         reasons.append(f"out_of_range_intervals:{out_of_range_cnt}")
-    if host_hit_tokens != host_hit_tokens_sum:
+    if host_fetched_tokens != host_fetched_tokens_sum:
         valid = False
-        reasons.append("host_hit_tokens_mismatch")
-    if total_cache_tokens != gpu_hit_tokens + host_hit_tokens:
+        reasons.append("host_fetched_tokens_mismatch")
+    if total_cached_tokens != gpu_resident_tokens + host_fetched_tokens:
         valid = False
-        reasons.append("total_cache_tokens_mismatch")
+        reasons.append("total_cached_tokens_mismatch")
     if abs(compute_ms - (forward_ms - stall_ms)) > 1e-3:
         valid = False
         reasons.append("compute_ms_mismatch")
@@ -409,11 +409,11 @@ def finalize_step_timing(
         is_prefill=bool(events.is_prefill),
         num_tokens=int(events.num_tokens),
         num_layers=num_layers,
-        total_cache_tokens=total_cache_tokens,
+        total_cached_tokens=total_cached_tokens,
         new_prefill_tokens=new_prefill_tokens,
-        gpu_hit_tokens=gpu_hit_tokens,
-        host_hit_tokens=host_hit_tokens,
-        host_hit_tokens_by_tier=host_hit_tokens_by_tier,
+        gpu_resident_tokens=gpu_resident_tokens,
+        host_fetched_tokens=host_fetched_tokens,
+        host_fetched_tokens_by_tier=host_fetched_tokens_by_tier,
         valid=bool(valid),
         reason=str(reason),
         tp_reduced=bool(tp_reduced),

@@ -171,7 +171,7 @@ class SchedulerOutput:
 class PrefillBatchTelemetry:
     batch_id: int
     new_prefill_tokens: int
-    gpu_hit_tokens: int
-    host_hit_tokens: int
-    total_cache_tokens: int
-    host_hit_tokens_by_tier: dict[str, int] = field(default_factory=dict)
+    gpu_resident_tokens: int
+    host_fetched_tokens: int
+    total_cached_tokens: int
+    host_fetched_tokens_by_tier: dict[str, int] = field(default_factory=dict)

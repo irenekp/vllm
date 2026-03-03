@@ -179,7 +179,7 @@ class Scheduler(SchedulerInterface):
         self.prefill_batch_next_id = 1
 
     @staticmethod
-    def _extract_host_hits_by_tier(
+    def _extract_host_fetched_tokens_by_tier(
         request: Request,
     ) -> dict[str, int]:
         kv_params = getattr(request, "kv_transfer_params", None)
@@ -189,21 +189,19 @@ class Scheduler(SchedulerInterface):
         if not isinstance(telemetry, dict):
             return {}
 
-        raw_tiers = telemetry.get("lmcache_tier_hit_tokens")
+        cache_accounting = telemetry.get("cache_accounting")
+        if not isinstance(cache_accounting, dict):
+            return {}
+
+        raw_tiers = cache_accounting.get("host_fetched_tokens_by_tier")
         if not isinstance(raw_tiers, dict):
             return {}
 
-        host_by_tier = {
+        return {
             str(k): int(v)
             for k, v in raw_tiers.items()
             if int(v) > 0
         }
-        if telemetry.get("recalc_last_token", False) and host_by_tier:
-            dominant_tier = max(host_by_tier, key=lambda k: host_by_tier[k])
-            host_by_tier[dominant_tier] = max(0, host_by_tier[dominant_tier] - 1)
-            if host_by_tier[dominant_tier] == 0:
-                host_by_tier.pop(dominant_tier)
-        return host_by_tier
 
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
@@ -232,10 +230,10 @@ class Scheduler(SchedulerInterface):
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
         prefill_batch_has_work = False
         prefill_new_prefill_tokens = 0
-        prefill_gpu_hit_tokens = 0
-        prefill_host_hit_tokens = 0
-        prefill_total_cache_tokens = 0
-        prefill_host_hit_tokens_by_tier: dict[str, int] = defaultdict(int)
+        prefill_gpu_resident_tokens = 0
+        prefill_host_fetched_tokens = 0
+        prefill_total_cached_tokens = 0
+        prefill_host_fetched_tokens_by_tier: dict[str, int] = defaultdict(int)
 
         # For logging.
         scheduled_timestamp = time.monotonic()
@@ -565,13 +563,18 @@ class Scheduler(SchedulerInterface):
                     raise RuntimeError(
                         f"Invalid request status: {request.status}")
 
-                gpu_hit_tokens = 0
-                host_hit_tokens_by_tier: dict[str, int] = {}
+                gpu_resident_tokens = 0
+                host_fetched_tokens_by_tier: dict[str, int] = {}
+                host_fetched_tokens = 0
                 if should_count_cache_hits:
-                    gpu_hit_tokens = int(num_new_local_computed_tokens)
-                    host_hit_tokens_by_tier = self._extract_host_hits_by_tier(request)
-                host_hit_tokens = int(sum(host_hit_tokens_by_tier.values()))
-                total_cache_tokens = int(gpu_hit_tokens + host_hit_tokens)
+                    gpu_resident_tokens = int(num_new_local_computed_tokens)
+                    host_fetched_tokens = int(num_external_computed_tokens)
+                    host_fetched_tokens_by_tier = (
+                        self._extract_host_fetched_tokens_by_tier(request)
+                    )
+                total_cached_tokens = int(
+                    gpu_resident_tokens + host_fetched_tokens
+                )
 
                 prefill_tokens_this_step = min(
                     int(num_new_tokens),
@@ -580,11 +583,11 @@ class Scheduler(SchedulerInterface):
                 if prefill_tokens_this_step > 0:
                     prefill_batch_has_work = True
                     prefill_new_prefill_tokens += prefill_tokens_this_step
-                prefill_gpu_hit_tokens += gpu_hit_tokens
-                prefill_host_hit_tokens += host_hit_tokens
-                prefill_total_cache_tokens += total_cache_tokens
-                for tier, value in host_hit_tokens_by_tier.items():
-                    prefill_host_hit_tokens_by_tier[tier] += int(value)
+                prefill_gpu_resident_tokens += gpu_resident_tokens
+                prefill_host_fetched_tokens += host_fetched_tokens
+                prefill_total_cached_tokens += total_cached_tokens
+                for tier, value in host_fetched_tokens_by_tier.items():
+                    prefill_host_fetched_tokens_by_tier[tier] += int(value)
 
                 if self.lora_config and request.lora_request:
                     scheduled_loras.add(request.lora_request.lora_int_id)
@@ -649,28 +652,28 @@ class Scheduler(SchedulerInterface):
                                      scheduled_spec_decode_tokens))
         prefill_batch_telemetry = None
         if prefill_batch_has_work:
-            host_hit_tokens_by_tier = {
+            host_fetched_tokens_by_tier = {
                 tier: int(value)
-                for tier, value in prefill_host_hit_tokens_by_tier.items()
+                for tier, value in prefill_host_fetched_tokens_by_tier.items()
                 if int(value) > 0
             }
-            if prefill_host_hit_tokens != sum(host_hit_tokens_by_tier.values()):
+            if prefill_host_fetched_tokens != sum(host_fetched_tokens_by_tier.values()):
                 raise RuntimeError(
-                    "integrity_violation: host_hit_tokens_by_tier_sum_mismatch"
+                    "integrity_violation: host_fetched_tokens_by_tier_sum_mismatch"
                 )
-            if prefill_total_cache_tokens != (
-                prefill_gpu_hit_tokens + prefill_host_hit_tokens
+            if prefill_total_cached_tokens != (
+                prefill_gpu_resident_tokens + prefill_host_fetched_tokens
             ):
                 raise RuntimeError(
-                    "integrity_violation: total_cache_tokens_mismatch"
+                    "integrity_violation: total_cached_tokens_mismatch"
                 )
             prefill_batch_telemetry = PrefillBatchTelemetry(
                 batch_id=int(self.prefill_batch_next_id),
                 new_prefill_tokens=int(prefill_new_prefill_tokens),
-                gpu_hit_tokens=int(prefill_gpu_hit_tokens),
-                host_hit_tokens=int(prefill_host_hit_tokens),
-                total_cache_tokens=int(prefill_total_cache_tokens),
-                host_hit_tokens_by_tier=host_hit_tokens_by_tier,
+                gpu_resident_tokens=int(prefill_gpu_resident_tokens),
+                host_fetched_tokens=int(prefill_host_fetched_tokens),
+                total_cached_tokens=int(prefill_total_cached_tokens),
+                host_fetched_tokens_by_tier=host_fetched_tokens_by_tier,
             )
             self.prefill_batch_next_id += 1
 

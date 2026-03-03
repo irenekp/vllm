@@ -643,32 +643,32 @@ async def get_cache_batch_timing(
                     detail="integrity_violation: invalid_batch_id",
                 )
 
-            host_hit_tokens_by_tier = {
+            host_fetched_tokens_by_tier = {
                 str(k): int(v)
-                for k, v in (record.get("host_hit_tokens_by_tier") or {}).items()
+                for k, v in (record.get("host_fetched_tokens_by_tier") or {}).items()
                 if int(v) > 0
             }
-            host_hit_tokens = int(record.get("host_hit_tokens", 0))
-            gpu_hit_tokens = int(record.get("gpu_hit_tokens", 0))
-            total_cache_tokens = int(record.get("total_cache_tokens", 0))
-            if host_hit_tokens != sum(host_hit_tokens_by_tier.values()):
+            host_fetched_tokens = int(record.get("host_fetched_tokens", 0))
+            gpu_resident_tokens = int(record.get("gpu_resident_tokens", 0))
+            total_cached_tokens = int(record.get("total_cached_tokens", 0))
+            if host_fetched_tokens != sum(host_fetched_tokens_by_tier.values()):
                 raise HTTPException(
                     status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-                    detail="integrity_violation: host_hit_tokens_mismatch",
+                    detail="integrity_violation: host_fetched_tokens_mismatch",
                 )
-            if total_cache_tokens != gpu_hit_tokens + host_hit_tokens:
+            if total_cached_tokens != gpu_resident_tokens + host_fetched_tokens:
                 raise HTTPException(
                     status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-                    detail="integrity_violation: total_cache_tokens_mismatch",
+                    detail="integrity_violation: total_cached_tokens_mismatch",
                 )
 
             non_timing = {
                 "batch_id": batch_id,
-                "total_cache_tokens": total_cache_tokens,
+                "total_cached_tokens": total_cached_tokens,
                 "new_prefill_tokens": int(record.get("new_prefill_tokens", 0)),
-                "gpu_hit_tokens": gpu_hit_tokens,
-                "host_hit_tokens": host_hit_tokens,
-                "host_hit_tokens_by_tier": host_hit_tokens_by_tier,
+                "gpu_resident_tokens": gpu_resident_tokens,
+                "host_fetched_tokens": host_fetched_tokens,
+                "host_fetched_tokens_by_tier": host_fetched_tokens_by_tier,
             }
             timing_forward = float(record.get("forward_ms", 0.0))
             timing_stall = float(record.get("stall_ms", 0.0))
@@ -684,11 +684,11 @@ async def get_cache_batch_timing(
                 }
             else:
                 for field in (
-                    "total_cache_tokens",
+                    "total_cached_tokens",
                     "new_prefill_tokens",
-                    "gpu_hit_tokens",
-                    "host_hit_tokens",
-                    "host_hit_tokens_by_tier",
+                    "gpu_resident_tokens",
+                    "host_fetched_tokens",
+                    "host_fetched_tokens_by_tier",
                 ):
                     if current[field] != non_timing[field]:
                         raise HTTPException(
@@ -710,11 +710,11 @@ async def get_cache_batch_timing(
                 "stall_ms": float(row["stall_ms"]),
                 "copy_ms": float(row["copy_ms"]),
                 "compute_ms": compute_ms,
-                "total_cache_tokens": int(row["total_cache_tokens"]),
+                "total_cached_tokens": int(row["total_cached_tokens"]),
                 "new_prefill_tokens": int(row["new_prefill_tokens"]),
-                "gpu_hit_tokens": int(row["gpu_hit_tokens"]),
-                "host_hit_tokens": int(row["host_hit_tokens"]),
-                "host_hit_tokens_by_tier": row["host_hit_tokens_by_tier"],
+                "gpu_resident_tokens": int(row["gpu_resident_tokens"]),
+                "host_fetched_tokens": int(row["host_fetched_tokens"]),
+                "host_fetched_tokens_by_tier": row["host_fetched_tokens_by_tier"],
             }
         )
 

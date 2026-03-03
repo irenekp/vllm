@@ -840,9 +840,9 @@ class Worker(WorkerBase):
             if rec is None or not rec.is_prefill:
                 continue
 
-            host_hit_tokens_by_tier = {
+            host_fetched_tokens_by_tier = {
                 str(k): int(v)
-                for k, v in (rec.host_hit_tokens_by_tier or {}).items()
+                for k, v in (rec.host_fetched_tokens_by_tier or {}).items()
                 if int(v) > 0
             }
             records.append(
@@ -852,11 +852,11 @@ class Worker(WorkerBase):
                     "stall_ms": float(rec.stall_ms),
                     "copy_ms": float(rec.copy_ms),
                     "compute_ms": float(rec.compute_ms),
-                    "total_cache_tokens": int(rec.total_cache_tokens),
+                    "total_cached_tokens": int(rec.total_cached_tokens),
                     "new_prefill_tokens": int(rec.new_prefill_tokens),
-                    "gpu_hit_tokens": int(rec.gpu_hit_tokens),
-                    "host_hit_tokens": int(rec.host_hit_tokens),
-                    "host_hit_tokens_by_tier": host_hit_tokens_by_tier,
+                    "gpu_resident_tokens": int(rec.gpu_resident_tokens),
+                    "host_fetched_tokens": int(rec.host_fetched_tokens),
+                    "host_fetched_tokens_by_tier": host_fetched_tokens_by_tier,
                 }
             )
 

@@ -2089,13 +2089,13 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 timing_step.is_prefill = True
                 timing_step.num_tokens = int(
                     scheduler_output.total_num_scheduled_tokens)
-                timing_step.total_cache_tokens = int(prefill_batch.total_cache_tokens)
+                timing_step.total_cached_tokens = int(prefill_batch.total_cached_tokens)
                 timing_step.new_prefill_tokens = int(prefill_batch.new_prefill_tokens)
-                timing_step.gpu_hit_tokens = int(prefill_batch.gpu_hit_tokens)
-                timing_step.host_hit_tokens = int(prefill_batch.host_hit_tokens)
-                timing_step.host_hit_tokens_by_tier = {
+                timing_step.gpu_resident_tokens = int(prefill_batch.gpu_resident_tokens)
+                timing_step.host_fetched_tokens = int(prefill_batch.host_fetched_tokens)
+                timing_step.host_fetched_tokens_by_tier = {
                     str(k): int(v)
-                    for k, v in prefill_batch.host_hit_tokens_by_tier.items()
+                    for k, v in prefill_batch.host_fetched_tokens_by_tier.items()
                     if int(v) > 0
                 }
 
