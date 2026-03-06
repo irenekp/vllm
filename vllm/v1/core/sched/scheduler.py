@@ -1280,12 +1280,12 @@ class Scheduler(SchedulerInterface):
                 "error": "kv_cache_events_disabled",
             }
         try:
-            duplicated_tokens = self.kv_duplication_tracker.duplicated_tokens()
+            stats = self.kv_duplication_tracker.duplication_stats()
         except Exception as e:
             return {
                 "error": f"integrity_violation: {e}",
             }
-        return {"duplicated_tokens": int(duplicated_tokens)}
+        return stats
 
     def make_stats(
         self,

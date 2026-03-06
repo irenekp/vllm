@@ -752,7 +752,39 @@ async def get_cache_duplication(request: Request):
             status_code=HTTPStatus.SERVICE_UNAVAILABLE,
             detail="cache duplication telemetry unavailable",
         )
-    return JSONResponse(content={"duplicated_tokens": int(duplicated_tokens)})
+
+    normalized_residence_tokens: list[dict[str, Any]] = []
+    raw_residence_tokens = stats.get("residence_tokens")
+    if isinstance(raw_residence_tokens, list):
+        for row in raw_residence_tokens:
+            if not isinstance(row, dict):
+                continue
+            raw_residence = row.get("residence")
+            raw_tokens = row.get("tokens")
+            if not isinstance(raw_residence, list):
+                continue
+            try:
+                residence = [str(name) for name in raw_residence]
+                if not residence:
+                    continue
+                tokens = int(raw_tokens)
+            except Exception:
+                continue
+            if tokens <= 0:
+                continue
+            normalized_residence_tokens.append(
+                {
+                    "residence": residence,
+                    "tokens": tokens,
+                }
+            )
+
+    return JSONResponse(
+        content={
+            "duplicated_tokens": int(duplicated_tokens),
+            "residence_tokens": normalized_residence_tokens,
+        }
+    )
 
 
 @router.post("/v1/responses",

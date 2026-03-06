@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable
+from typing import Any, Dict, FrozenSet, Iterable
 
 from vllm.distributed.kv_events import (
     AllBlocksCleared,
@@ -24,6 +24,14 @@ def _get_medium_name(medium: str | None) -> str:
     return medium or "unknown"
 
 
+def _ordered_residence(combo: FrozenSet[str]) -> list[str]:
+    if not combo:
+        return []
+    if MEDIUM_GPU in combo:
+        return [MEDIUM_GPU] + sorted(t for t in combo if t != MEDIUM_GPU)
+    return sorted(combo)
+
+
 @dataclass
 class DuplicationCounts:
     gpu_only: int = 0
@@ -44,31 +52,127 @@ class KVDuplicationTracker:
     def __init__(self) -> None:
         self._gpu_resident: dict[str, int] = {}
         self._cpu_resident: dict[str, dict[str, int]] = {}
+        self._residence_combo_tokens: dict[FrozenSet[str], int] = {}
+        self._integrity_errors_by_key: dict[str, str] = {}
         self._counts = DuplicationCounts()
 
     def reset(self) -> None:
         self._gpu_resident.clear()
         self._cpu_resident.clear()
+        self._residence_combo_tokens.clear()
+        self._integrity_errors_by_key.clear()
         self._counts = DuplicationCounts()
 
     def counts(self) -> DuplicationCounts:
         return self._counts
 
+    def _get_combo_for_key(self, key: str) -> FrozenSet[str]:
+        combo: set[str] = set()
+        if key in self._gpu_resident:
+            combo.add(MEDIUM_GPU)
+        tiers = self._cpu_resident.get(key)
+        if tiers:
+            combo.update(tiers.keys())
+        return frozenset(combo)
+
+    def _get_token_count_for_key(self, key: str) -> int | None:
+        gpu_tokens = self._gpu_resident.get(key)
+        if gpu_tokens is not None:
+            return int(gpu_tokens)
+        tiers = self._cpu_resident.get(key)
+        if not tiers:
+            return None
+        first = next(iter(tiers.values()), None)
+        return int(first) if first is not None else None
+
+    def _apply_combo_transition(
+        self,
+        old_combo: FrozenSet[str],
+        old_tokens: int | None,
+        new_combo: FrozenSet[str],
+        new_tokens: int | None,
+    ) -> None:
+        if old_combo == new_combo and old_tokens == new_tokens:
+            return
+
+        if old_combo and old_tokens is not None and old_tokens > 0:
+            updated = self._residence_combo_tokens.get(old_combo, 0) - int(old_tokens)
+            if updated > 0:
+                self._residence_combo_tokens[old_combo] = int(updated)
+            else:
+                self._residence_combo_tokens.pop(old_combo, None)
+
+        if new_combo and new_tokens is not None and new_tokens > 0:
+            self._residence_combo_tokens[new_combo] = int(
+                self._residence_combo_tokens.get(new_combo, 0) + int(new_tokens)
+            )
+
+    def _refresh_key_integrity(self, key: str) -> None:
+        observed: dict[str, int] = {}
+        gpu_tokens = self._gpu_resident.get(key)
+        if gpu_tokens is not None:
+            observed[MEDIUM_GPU] = int(gpu_tokens)
+
+        tiers = self._cpu_resident.get(key, {})
+        for tier, tokens in tiers.items():
+            observed[str(tier)] = int(tokens)
+
+        if len(observed) <= 1:
+            self._integrity_errors_by_key.pop(key, None)
+            return
+
+        token_values = set(observed.values())
+        if len(token_values) == 1:
+            self._integrity_errors_by_key.pop(key, None)
+            return
+
+        ordered = _ordered_residence(frozenset(observed))
+        details = ", ".join(f"{name}={observed[name]}" for name in ordered)
+        self._integrity_errors_by_key[key] = (
+            f"Token-count mismatch for block {key}: {details}"
+        )
+
+    def _raise_if_integrity_violated(self) -> None:
+        if not self._integrity_errors_by_key:
+            return
+        first_key = sorted(self._integrity_errors_by_key.keys())[0]
+        raise RuntimeError(self._integrity_errors_by_key[first_key])
+
+    def _serialize_residence_tokens(self) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for combo, tokens in self._residence_combo_tokens.items():
+            if not combo or int(tokens) <= 0:
+                continue
+            rows.append(
+                {
+                    "residence": _ordered_residence(combo),
+                    "tokens": int(tokens),
+                }
+            )
+        rows.sort(key=lambda row: (len(row["residence"]), row["residence"]))
+        return rows
+
     def duplicated_tokens(self) -> int:
         """Return unique duplicated tokens across GPU and any host tier."""
+        self._raise_if_integrity_violated()
         total = 0
-        for key, gpu_tokens in self._gpu_resident.items():
-            tiers = self._cpu_resident.get(key)
-            if not tiers:
+        for combo, tokens in self._residence_combo_tokens.items():
+            if MEDIUM_GPU not in combo or len(combo) <= 1:
                 continue
-            for tier_name, tier_tokens in tiers.items():
-                if int(tier_tokens) != int(gpu_tokens):
-                    raise RuntimeError(
-                        f"Token-count mismatch for block {key}: gpu={gpu_tokens}, "
-                        f"{tier_name}={tier_tokens}"
-                    )
-            total += int(gpu_tokens)
+            total += int(tokens)
         return int(total)
+
+    def duplication_stats(self) -> dict[str, Any]:
+        self._raise_if_integrity_violated()
+        duplicated_tokens = 0
+        for combo, tokens in self._residence_combo_tokens.items():
+            if MEDIUM_GPU not in combo or len(combo) <= 1:
+                continue
+            duplicated_tokens += int(tokens)
+        return {
+            "duplicated_tokens": int(duplicated_tokens),
+            "residence_tokens": self._serialize_residence_tokens(),
+        }
 
     def update(self, events: Iterable[KVCacheEvent]) -> None:
         for event in events:
@@ -98,39 +202,56 @@ class KVDuplicationTracker:
                 self._cpu_remove(_normalize_block_hash(bh), medium)
 
     def _gpu_add(self, key: str, num_tokens: int) -> None:
-        if key in self._gpu_resident:
-            return
-        self._gpu_resident[key] = num_tokens
-        cpu_tiers = self._cpu_resident.get(key)
-        if cpu_tiers:
-            for tier in cpu_tiers:
+        old_combo = self._get_combo_for_key(key)
+        old_tokens = self._get_token_count_for_key(key)
+
+        if key not in self._gpu_resident:
+            self._gpu_resident[key] = num_tokens
+            cpu_tiers = self._cpu_resident.get(key)
+            if cpu_tiers:
+                for tier in cpu_tiers:
+                    self._counts.both_by_tier[tier] = (
+                        self._counts.both_by_tier.get(tier, 0) + num_tokens
+                    )
+                    self._counts.cpu_only_by_tier[tier] = max(
+                        0, self._counts.cpu_only_by_tier.get(tier, 0) - num_tokens
+                    )
+            else:
+                self._counts.gpu_only += num_tokens
+
+        new_combo = self._get_combo_for_key(key)
+        new_tokens = self._get_token_count_for_key(key)
+        self._apply_combo_transition(old_combo, old_tokens, new_combo, new_tokens)
+        self._refresh_key_integrity(key)
+
+    def _cpu_add(self, key: str, num_tokens: int, tier: str) -> None:
+        old_combo = self._get_combo_for_key(key)
+        old_tokens = self._get_token_count_for_key(key)
+
+        tiers = self._cpu_resident.setdefault(key, {})
+        if tier not in tiers:
+            had_cpu_tiers = bool(tiers)
+            tiers[tier] = num_tokens
+            if key in self._gpu_resident:
                 self._counts.both_by_tier[tier] = (
                     self._counts.both_by_tier.get(tier, 0) + num_tokens
                 )
-                self._counts.cpu_only_by_tier[tier] = max(
-                    0, self._counts.cpu_only_by_tier.get(tier, 0) - num_tokens
+                if not had_cpu_tiers:
+                    self._counts.gpu_only = max(0, self._counts.gpu_only - num_tokens)
+            else:
+                self._counts.cpu_only_by_tier[tier] = (
+                    self._counts.cpu_only_by_tier.get(tier, 0) + num_tokens
                 )
-        else:
-            self._counts.gpu_only += num_tokens
 
-    def _cpu_add(self, key: str, num_tokens: int, tier: str) -> None:
-        tiers = self._cpu_resident.setdefault(key, {})
-        if tier in tiers:
-            return
-        had_cpu_tiers = bool(tiers)
-        tiers[tier] = num_tokens
-        if key in self._gpu_resident:
-            self._counts.both_by_tier[tier] = (
-                self._counts.both_by_tier.get(tier, 0) + num_tokens
-            )
-            if not had_cpu_tiers:
-                self._counts.gpu_only = max(0, self._counts.gpu_only - num_tokens)
-        else:
-            self._counts.cpu_only_by_tier[tier] = (
-                self._counts.cpu_only_by_tier.get(tier, 0) + num_tokens
-            )
+        new_combo = self._get_combo_for_key(key)
+        new_tokens = self._get_token_count_for_key(key)
+        self._apply_combo_transition(old_combo, old_tokens, new_combo, new_tokens)
+        self._refresh_key_integrity(key)
 
     def _gpu_remove(self, key: str) -> None:
+        old_combo = self._get_combo_for_key(key)
+        old_tokens = self._get_token_count_for_key(key)
+
         num_tokens = self._gpu_resident.pop(key, None)
         if num_tokens is None:
             return
@@ -146,12 +267,20 @@ class KVDuplicationTracker:
         else:
             self._counts.gpu_only = max(0, self._counts.gpu_only - num_tokens)
 
+        new_combo = self._get_combo_for_key(key)
+        new_tokens = self._get_token_count_for_key(key)
+        self._apply_combo_transition(old_combo, old_tokens, new_combo, new_tokens)
+        self._refresh_key_integrity(key)
+
     def _clear_gpu_only(self) -> None:
         keys = list(self._gpu_resident.keys())
         for key in keys:
             self._gpu_remove(key)
 
     def _cpu_remove(self, key: str, tier: str) -> None:
+        old_combo = self._get_combo_for_key(key)
+        old_tokens = self._get_token_count_for_key(key)
+
         tiers = self._cpu_resident.get(key)
         if not tiers or tier not in tiers:
             return
@@ -169,3 +298,8 @@ class KVDuplicationTracker:
             self._counts.cpu_only_by_tier[tier] = max(
                 0, self._counts.cpu_only_by_tier.get(tier, 0) - num_tokens
             )
+
+        new_combo = self._get_combo_for_key(key)
+        new_tokens = self._get_token_count_for_key(key)
+        self._apply_combo_transition(old_combo, old_tokens, new_combo, new_tokens)
+        self._refresh_key_integrity(key)
