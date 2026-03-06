@@ -29,6 +29,7 @@ from vllm.entrypoints.logger import RequestLogger
 from vllm.entrypoints.openai.protocol import (
     ChatCompletionLogProb, ChatCompletionLogProbs,
     ChatCompletionLogProbsContent, ChatCompletionNamedToolChoiceParam,
+    CacheDuplicationResidenceToken, CacheDuplicationTelemetry,
     ChatCompletionRequest, ChatCompletionResponse,
     ChatCompletionResponseChoice, ChatCompletionResponseStreamChoice,
     ChatCompletionStreamResponse, ChatMessage, DeltaFunctionCall, DeltaMessage,
@@ -157,6 +158,93 @@ class OpenAIServingChat(OpenAIServing):
         # Please use the Responses API instead.
         self.supports_code_interpreter = False
         self.python_tool = None
+
+    async def _get_cache_duplication_payload(
+        self,
+        request: ChatCompletionRequest,
+    ) -> Optional[CacheDuplicationTelemetry]:
+        if not request.include_cache_duplication:
+            return None
+
+        try:
+            raw_stats = await self.engine_client.get_kv_duplication_stats()
+        except Exception as e:
+            return CacheDuplicationTelemetry(
+                available=False,
+                duplicated_tokens=0,
+                error=str(e),
+            )
+
+        if not isinstance(raw_stats, dict):
+            return CacheDuplicationTelemetry(
+                available=False,
+                duplicated_tokens=0,
+                error="cache duplication telemetry unavailable",
+            )
+
+        raw_error = raw_stats.get("error")
+        if isinstance(raw_error, str):
+            return CacheDuplicationTelemetry(
+                available=False,
+                duplicated_tokens=0,
+                error=raw_error,
+            )
+
+        if raw_stats.get("available") is False:
+            reason = raw_stats.get("reason") or raw_stats.get("error")
+            return CacheDuplicationTelemetry(
+                available=False,
+                duplicated_tokens=0,
+                error=(str(reason)
+                       if reason is not None else
+                       "cache duplication telemetry unavailable"),
+            )
+
+        raw_duplicated_tokens = raw_stats.get("duplicated_tokens")
+        try:
+            duplicated_tokens = int(raw_duplicated_tokens)
+        except (TypeError, ValueError):
+            return CacheDuplicationTelemetry(
+                available=False,
+                duplicated_tokens=0,
+                error="cache duplication telemetry unavailable",
+            )
+
+        residence_tokens_payload: list[CacheDuplicationResidenceToken] = []
+        raw_residence_tokens = raw_stats.get("residence_tokens")
+        if isinstance(raw_residence_tokens, list):
+            for row in raw_residence_tokens:
+                if not isinstance(row, dict):
+                    continue
+
+                raw_residence = row.get("residence")
+                raw_tokens = row.get("tokens")
+                if not isinstance(raw_residence, list):
+                    continue
+
+                try:
+                    residence = [str(item) for item in raw_residence]
+                    tokens = int(raw_tokens)
+                except (TypeError, ValueError):
+                    continue
+
+                if not residence:
+                    continue
+                if tokens <= 0:
+                    continue
+
+                residence_tokens_payload.append(
+                    CacheDuplicationResidenceToken(
+                        residence=residence,
+                        tokens=tokens,
+                    ))
+
+        return CacheDuplicationTelemetry(
+            available=True,
+            duplicated_tokens=duplicated_tokens,
+            residence_tokens=(
+                residence_tokens_payload if residence_tokens_payload else None),
+        )
 
     async def create_chat_completion(
         self,
@@ -557,6 +645,8 @@ class OpenAIServingChat(OpenAIServing):
                                        stream_options.continuous_usage_stats
         else:
             include_usage, include_continuous_usage = False, False
+
+        cache_duplication: Optional[CacheDuplicationTelemetry] = None
 
         try:
             async for res in result_generator:
@@ -1083,6 +1173,10 @@ class OpenAIServingChat(OpenAIServing):
 
             # once the final token is handled, if stream_options.include_usage
             # is sent, send the usage
+            if request.include_cache_duplication:
+                cache_duplication = await self._get_cache_duplication_payload(
+                    request)
+
             if include_usage:
                 completion_tokens = sum(previous_num_tokens)
                 final_usage = UsageInfo(prompt_tokens=num_prompt_tokens,
@@ -1099,10 +1193,23 @@ class OpenAIServingChat(OpenAIServing):
                     created=created_time,
                     choices=[],
                     model=model_name,
-                    usage=final_usage)
+                    usage=final_usage,
+                    cache_duplication=cache_duplication)
                 final_usage_data = (final_usage_chunk.model_dump_json(
                     exclude_unset=True, exclude_none=True))
                 yield f"data: {final_usage_data}\n\n"
+            elif request.include_cache_duplication:
+                telemetry_chunk = ChatCompletionStreamResponse(
+                    id=request_id,
+                    object=chunk_object_type,
+                    created=created_time,
+                    choices=[],
+                    model=model_name,
+                    cache_duplication=cache_duplication,
+                )
+                telemetry_data = telemetry_chunk.model_dump_json(
+                    exclude_unset=True, exclude_none=True)
+                yield f"data: {telemetry_data}\n\n"
 
             # report to FastAPI middleware aggregate usage across all choices
             num_completion_tokens = sum(previous_num_tokens)
@@ -1405,8 +1512,9 @@ class OpenAIServingChat(OpenAIServing):
                 cached_tokens=final_res.num_cached_tokens)
 
         request_metadata.final_usage_info = usage
+        cache_duplication = await self._get_cache_duplication_payload(request)
 
-        response = ChatCompletionResponse(
+        response_kwargs = dict(
             id=request_id,
             created=created_time,
             model=model_name,
@@ -1417,6 +1525,11 @@ class OpenAIServingChat(OpenAIServing):
                               if request.return_token_ids else None),
             kv_transfer_params=final_res.kv_transfer_params,
         )
+
+        if request.include_cache_duplication:
+            response_kwargs["cache_duplication"] = cache_duplication
+
+        response = ChatCompletionResponse(**response_kwargs)
 
         # Log complete response if output logging is enabled
         if self.enable_log_outputs and self.request_logger:

@@ -140,6 +140,18 @@ class UsageInfo(OpenAIBaseModel):
     prompt_tokens_details: Optional[PromptTokenUsageInfo] = None
 
 
+class CacheDuplicationResidenceToken(OpenAIBaseModel):
+    residence: list[str]
+    tokens: int
+
+
+class CacheDuplicationTelemetry(OpenAIBaseModel):
+    available: bool
+    duplicated_tokens: int = 0
+    residence_tokens: Optional[list[CacheDuplicationResidenceToken]] = None
+    error: Optional[str] = None
+
+
 class RequestResponseMetadata(BaseModel):
     request_id: str
     final_usage_info: Optional[UsageInfo] = None
@@ -424,6 +436,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     stop: Optional[Union[str, list[str]]] = []
     stream: Optional[bool] = False
     stream_options: Optional[StreamOptions] = None
+    include_cache_duplication: bool = False
     temperature: Optional[float] = None
     top_p: Optional[float] = None
     tools: Optional[list[ChatCompletionToolsParam]] = None
@@ -1796,6 +1809,7 @@ class ChatCompletionResponse(OpenAIBaseModel):
                                    "priority"]] = None
     system_fingerprint: Optional[str] = None
     usage: UsageInfo
+    cache_duplication: Optional[CacheDuplicationTelemetry] = None
 
     # vLLM-specific fields that are not in OpenAI spec
     prompt_logprobs: Optional[list[Optional[dict[int, Logprob]]]] = None
@@ -1830,6 +1844,7 @@ class ChatCompletionStreamResponse(OpenAIBaseModel):
     usage: Optional[UsageInfo] = Field(default=None)
     # not part of the OpenAI spec but for tracing the tokens
     prompt_token_ids: Optional[list[int]] = None
+    cache_duplication: Optional[CacheDuplicationTelemetry] = None
 
 
 class TranscriptionResponseStreamChoice(OpenAIBaseModel):
