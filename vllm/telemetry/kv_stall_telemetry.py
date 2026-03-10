@@ -32,9 +32,13 @@ class BatchTimingEvents:
     host_fetched_tokens: int = 0
     host_fetched_tokens_by_tier: dict[str, int] = field(default_factory=dict)
 
-    # ---- raw timing events ----
+    # ---- raw timing events (load / read path) ----
     copy_intervals: List[CudaEventInterval] = field(default_factory=list)
     stall_intervals: List[CudaEventInterval] = field(default_factory=list)
+
+    # ---- raw timing events (store / write path) ----
+    store_copy_intervals: List[CudaEventInterval] = field(default_factory=list)
+    store_stall_intervals: List[CudaEventInterval] = field(default_factory=list)
 
     forward_start: Optional[torch.cuda.Event] = None
     forward_end: Optional[torch.cuda.Event] = None
@@ -65,7 +69,7 @@ class BatchTimingRecord:
     unattributed_layer_intervals: int
     out_of_range_layer_intervals: int
 
-    # ---- timings ----
+    # ---- timings (load / read) ----
     forward_ms: float
     stall_ms: float
     stall_ms_unattributed: float
@@ -73,6 +77,11 @@ class BatchTimingRecord:
 
     copy_ms: float
     compute_ms: float
+
+    # ---- timings (store / write) ----
+    store_copy_ms: float = 0.0
+    store_stall_ms: float = 0.0
+    store_stall_ms_by_layer: List[float] = field(default_factory=list)
 
 
 class VLLMTimingSink:
@@ -119,6 +128,32 @@ class VLLMTimingSink:
         if cur is None:
             return
         cur.stall_intervals.append(
+            CudaEventInterval(start_ev, end_ev, layer_id=layer_id)
+        )
+
+    def record_store_copy_interval(
+        self,
+        start_ev: torch.cuda.Event,
+        end_ev: torch.cuda.Event,
+        layer_id: Optional[int] = None,
+    ) -> None:
+        cur = self._cur
+        if cur is None:
+            return
+        cur.store_copy_intervals.append(
+            CudaEventInterval(start_ev, end_ev, layer_id=layer_id)
+        )
+
+    def record_store_stall_interval(
+        self,
+        start_ev: torch.cuda.Event,
+        end_ev: torch.cuda.Event,
+        layer_id: Optional[int] = None,
+    ) -> None:
+        cur = self._cur
+        if cur is None:
+            return
+        cur.store_stall_intervals.append(
             CudaEventInterval(start_ev, end_ev, layer_id=layer_id)
         )
 
@@ -333,6 +368,11 @@ def finalize_step_timing(
             stall_ms_by_layer=[],
             copy_ms=copy_ms,
             compute_ms=float(forward_ms - stall_ms),
+            store_copy_ms=float(_sum_intervals_ms(
+                events.store_copy_intervals)),
+            store_stall_ms=float(_sum_intervals_ms(
+                events.store_stall_intervals)),
+            store_stall_ms_by_layer=[],
         )
 
     (stall_by_layer, stall_unattributed, unattributed_cnt, out_of_range_cnt,
@@ -359,6 +399,17 @@ def finalize_step_timing(
 
     stall_ms = float(sum(stall_by_layer) + stall_unattributed)
     compute_ms = float(forward_ms - stall_ms)
+
+    # Store (write-back) timing
+    store_copy_ms = float(_sum_intervals_ms(events.store_copy_intervals))
+    if events.store_stall_intervals:
+        (store_stall_by_layer, _store_unattr, _, _, _) = \
+            _sum_intervals_ms_by_layer(
+                events.store_stall_intervals, num_layers=num_layers)
+        store_stall_ms = float(sum(store_stall_by_layer) + _store_unattr)
+    else:
+        store_stall_by_layer = []
+        store_stall_ms = 0.0
 
     # Validity rules (explicit + conservative)
     valid = True
@@ -427,4 +478,7 @@ def finalize_step_timing(
         stall_ms_by_layer=[float(x) for x in stall_by_layer],
         copy_ms=float(copy_ms),
         compute_ms=float(compute_ms),
+        store_copy_ms=float(store_copy_ms),
+        store_stall_ms=float(store_stall_ms),
+        store_stall_ms_by_layer=[float(x) for x in store_stall_by_layer],
     )
