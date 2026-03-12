@@ -673,6 +673,8 @@ async def get_cache_batch_timing(
             timing_forward = float(record.get("forward_ms", 0.0))
             timing_stall = float(record.get("stall_ms", 0.0))
             timing_copy = float(record.get("copy_ms", 0.0))
+            timing_store_copy = float(record.get("store_copy_ms", 0.0))
+            timing_store_stall = float(record.get("store_stall_ms", 0.0))
 
             current = merged.get(batch_id)
             if current is None:
@@ -681,6 +683,8 @@ async def get_cache_batch_timing(
                     "forward_ms": timing_forward,
                     "stall_ms": timing_stall,
                     "copy_ms": timing_copy,
+                    "store_copy_ms": timing_store_copy,
+                    "store_stall_ms": timing_store_stall,
                 }
             else:
                 for field in (
@@ -698,6 +702,10 @@ async def get_cache_batch_timing(
                 current["forward_ms"] = max(current["forward_ms"], timing_forward)
                 current["stall_ms"] = max(current["stall_ms"], timing_stall)
                 current["copy_ms"] = max(current["copy_ms"], timing_copy)
+                current["store_copy_ms"] = max(
+                    current["store_copy_ms"], timing_store_copy)
+                current["store_stall_ms"] = max(
+                    current["store_stall_ms"], timing_store_stall)
 
     batches = []
     for batch_id in sorted(merged):
@@ -710,6 +718,8 @@ async def get_cache_batch_timing(
                 "stall_ms": float(row["stall_ms"]),
                 "copy_ms": float(row["copy_ms"]),
                 "compute_ms": compute_ms,
+                "store_copy_ms": float(row.get("store_copy_ms", 0.0)),
+                "store_stall_ms": float(row.get("store_stall_ms", 0.0)),
                 "total_cached_tokens": int(row["total_cached_tokens"]),
                 "new_prefill_tokens": int(row["new_prefill_tokens"]),
                 "gpu_resident_tokens": int(row["gpu_resident_tokens"]),

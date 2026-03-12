@@ -735,6 +735,9 @@ class Worker(WorkerBase):
                 "compute_ms": rec.compute_ms,
                 "stall_pct": (rec.stall_ms / rec.forward_ms)
                 if rec.forward_ms > 0 else 0.0,
+                "store_copy_ms": rec.store_copy_ms,
+                "store_stall_ms": rec.store_stall_ms,
+                "store_stall_ms_by_layer": rec.store_stall_ms_by_layer,
             }
 
         if mode in ("last", "debug_last"):
@@ -789,6 +792,8 @@ class Worker(WorkerBase):
             "copy_ms": _mean("copy_ms"),
             "compute_ms": _mean("compute_ms"),
             "stall_pct": _mean("stall_pct"),
+            "store_copy_ms": _mean("store_copy_ms"),
+            "store_stall_ms": _mean("store_stall_ms"),
             "valid_frac":
             float(
                 sum(1 for r in records if r.get("valid", False)) /
@@ -852,6 +857,8 @@ class Worker(WorkerBase):
                     "stall_ms": float(rec.stall_ms),
                     "copy_ms": float(rec.copy_ms),
                     "compute_ms": float(rec.compute_ms),
+                    "store_copy_ms": float(rec.store_copy_ms),
+                    "store_stall_ms": float(rec.store_stall_ms),
                     "total_cached_tokens": int(rec.total_cached_tokens),
                     "new_prefill_tokens": int(rec.new_prefill_tokens),
                     "gpu_resident_tokens": int(rec.gpu_resident_tokens),
