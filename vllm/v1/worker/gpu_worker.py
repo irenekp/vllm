@@ -732,6 +732,7 @@ class Worker(WorkerBase):
                 "stall_ms_unattributed": rec.stall_ms_unattributed,
                 "stall_ms_by_layer": rec.stall_ms_by_layer,
                 "copy_ms": rec.copy_ms,
+                "load_ms": rec.load_ms,
                 "compute_ms": rec.compute_ms,
                 "stall_pct": (rec.stall_ms / rec.forward_ms)
                 if rec.forward_ms > 0 else 0.0,
@@ -790,6 +791,7 @@ class Worker(WorkerBase):
             "forward_ms": _mean("forward_ms"),
             "stall_ms": _mean("stall_ms"),
             "copy_ms": _mean("copy_ms"),
+            "load_ms": _mean("load_ms"),
             "compute_ms": _mean("compute_ms"),
             "stall_pct": _mean("stall_pct"),
             "store_copy_ms": _mean("store_copy_ms"),
@@ -856,6 +858,7 @@ class Worker(WorkerBase):
                     "forward_ms": float(rec.forward_ms),
                     "stall_ms": float(rec.stall_ms),
                     "copy_ms": float(rec.copy_ms),
+                    "load_ms": float(rec.load_ms),
                     "compute_ms": float(rec.compute_ms),
                     "store_copy_ms": float(rec.store_copy_ms),
                     "store_stall_ms": float(rec.store_stall_ms),

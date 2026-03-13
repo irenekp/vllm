@@ -673,6 +673,7 @@ async def get_cache_batch_timing(
             timing_forward = float(record.get("forward_ms", 0.0))
             timing_stall = float(record.get("stall_ms", 0.0))
             timing_copy = float(record.get("copy_ms", 0.0))
+            timing_load = float(record.get("load_ms", 0.0))
             timing_store_copy = float(record.get("store_copy_ms", 0.0))
             timing_store_stall = float(record.get("store_stall_ms", 0.0))
 
@@ -683,6 +684,7 @@ async def get_cache_batch_timing(
                     "forward_ms": timing_forward,
                     "stall_ms": timing_stall,
                     "copy_ms": timing_copy,
+                    "load_ms": timing_load,
                     "store_copy_ms": timing_store_copy,
                     "store_stall_ms": timing_store_stall,
                 }
@@ -702,6 +704,7 @@ async def get_cache_batch_timing(
                 current["forward_ms"] = max(current["forward_ms"], timing_forward)
                 current["stall_ms"] = max(current["stall_ms"], timing_stall)
                 current["copy_ms"] = max(current["copy_ms"], timing_copy)
+                current["load_ms"] = max(current["load_ms"], timing_load)
                 current["store_copy_ms"] = max(
                     current["store_copy_ms"], timing_store_copy)
                 current["store_stall_ms"] = max(
@@ -717,6 +720,7 @@ async def get_cache_batch_timing(
                 "forward_ms": float(row["forward_ms"]),
                 "stall_ms": float(row["stall_ms"]),
                 "copy_ms": float(row["copy_ms"]),
+                "load_ms": float(row.get("load_ms", 0.0)),
                 "compute_ms": compute_ms,
                 "store_copy_ms": float(row.get("store_copy_ms", 0.0)),
                 "store_stall_ms": float(row.get("store_stall_ms", 0.0)),

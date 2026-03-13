@@ -2146,6 +2146,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 if timing_step is not None:
                     timing_step.load_end = torch.cuda.Event(enable_timing=True)
                     timing_step.load_end.record(timing_stream)
+                    record_guard_end = getattr(
+                        self._kv_stall_sink, "record_load_guard_end_ns", None
+                    )
+                    if callable(record_guard_end):
+                        record_guard_end(time.perf_counter_ns())
 
                 model_output = self.model(
                     input_ids=input_ids,

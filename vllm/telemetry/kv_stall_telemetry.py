@@ -6,8 +6,11 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Deque, List, Optional, Tuple
 
+import logging
 import threading
 import torch
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -35,6 +38,7 @@ class BatchTimingEvents:
     # ---- raw timing events (load / read path) ----
     copy_intervals: List[CudaEventInterval] = field(default_factory=list)
     stall_intervals: List[CudaEventInterval] = field(default_factory=list)
+    io_fetch_ms: float = 0.0
 
     # ---- raw timing events (store / write path) ----
     store_copy_intervals: List[CudaEventInterval] = field(default_factory=list)
@@ -43,6 +47,8 @@ class BatchTimingEvents:
     forward_start: Optional[torch.cuda.Event] = None
     forward_end: Optional[torch.cuda.Event] = None
     load_end: Optional[torch.cuda.Event] = None
+    load_guard_start_ns: Optional[int] = None
+    load_guard_end_ns: Optional[int] = None
 
 
 @dataclass
@@ -76,6 +82,7 @@ class BatchTimingRecord:
     stall_ms_by_layer: List[float]
 
     copy_ms: float
+    load_ms: float
     compute_ms: float
 
     # ---- timings (store / write) ----
@@ -130,6 +137,29 @@ class VLLMTimingSink:
         cur.stall_intervals.append(
             CudaEventInterval(start_ev, end_ev, layer_id=layer_id)
         )
+
+    def record_io_fetch_ms(
+        self,
+        elapsed_ms: float,
+        location: Optional[str] = None,
+    ) -> None:
+        del location
+        cur = self._cur
+        if cur is None:
+            return
+        cur.io_fetch_ms += max(0.0, float(elapsed_ms))
+
+    def record_load_guard_start_ns(self, ts_ns: int) -> None:
+        cur = self._cur
+        if cur is None:
+            return
+        cur.load_guard_start_ns = int(ts_ns)
+
+    def record_load_guard_end_ns(self, ts_ns: int) -> None:
+        cur = self._cur
+        if cur is None:
+            return
+        cur.load_guard_end_ns = int(ts_ns)
 
     def record_store_copy_interval(
         self,
@@ -326,6 +356,7 @@ def finalize_step_timing(
 
     forward_ms = float(events.forward_start.elapsed_time(events.forward_end))
     copy_ms = float(_sum_intervals_ms(events.copy_intervals))
+    io_fetch_ms = max(0.0, float(events.io_fetch_ms))
     host_fetched_tokens_by_tier = {
         str(k): int(v)
         for k, v in (events.host_fetched_tokens_by_tier or {}).items()
@@ -336,6 +367,31 @@ def finalize_step_timing(
     total_cached_tokens = int(events.total_cached_tokens)
     new_prefill_tokens = int(events.new_prefill_tokens)
     host_fetched_tokens_sum = int(sum(host_fetched_tokens_by_tier.values()))
+    load_ms = float(io_fetch_ms if host_fetched_tokens > 0 else 0.0)
+
+    if (
+        events.load_guard_start_ns is not None
+        and events.load_guard_end_ns is not None
+        and host_fetched_tokens > 0
+    ):
+        try:
+            guard_start_ns = int(events.load_guard_start_ns)
+            guard_end_ns = int(events.load_guard_end_ns)
+            if guard_end_ns >= guard_start_ns:
+                guard_ms = float((guard_end_ns - guard_start_ns) / 1e6)
+                tolerance_ms = max(0.5, 0.02 * max(guard_ms, 0.0))
+                if load_ms - guard_ms > tolerance_ms:
+                    logger.warning(
+                        "io_fetch_ms (%.3f) exceeded load guardrail envelope "
+                        "(%.3f) by %.3f ms for batch_id=%s tp_rank=%s",
+                        load_ms,
+                        guard_ms,
+                        load_ms - guard_ms,
+                        int(events.batch_id),
+                        int(events.tp_rank),
+                    )
+        except Exception:
+            logger.debug("Failed to evaluate load guardrail.", exc_info=True)
 
     # Compute per-layer stalls + attribution stats
     num_layers = int(events.num_layers)
@@ -367,6 +423,7 @@ def finalize_step_timing(
             stall_ms_unattributed=stall_ms,
             stall_ms_by_layer=[],
             copy_ms=copy_ms,
+            load_ms=load_ms,
             compute_ms=float(forward_ms - stall_ms),
             store_copy_ms=float(_sum_intervals_ms(
                 events.store_copy_intervals)),
@@ -477,6 +534,7 @@ def finalize_step_timing(
         stall_ms_unattributed=float(stall_unattributed),
         stall_ms_by_layer=[float(x) for x in stall_by_layer],
         copy_ms=float(copy_ms),
+        load_ms=float(load_ms),
         compute_ms=float(compute_ms),
         store_copy_ms=float(store_copy_ms),
         store_stall_ms=float(store_stall_ms),
